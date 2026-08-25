@@ -1,0 +1,186 @@
+import type {
+  CacheAdapter,
+  ClaudeRunner,
+  RunEvents,
+  RunRecord,
+  RunResult,
+  RunStatus,
+  StepKind,
+  StepRecord,
+  StorageAdapter,
+} from './types.ts';
+import { HaltSignal, StepFailedError, isHalt, messageOf } from './errors.ts';
+
+/** Everything a run needs that is not specific to one step kind. */
+export interface RunnerConfig {
+  pipeline: string;
+  runId: string;
+  workspace: string;
+  input: unknown;
+  model?: string;
+  declaredSteps: readonly string[];
+  events: RunEvents;
+  storage?: StorageAdapter;
+  cache?: CacheAdapter;
+  claude?: ClaudeRunner;
+  signal?: AbortSignal;
+}
+
+/**
+ * Owns one run: step ordering, records, lifecycle events and the write-through to
+ * storage. Step kinds sit on top of `execute()`; none of them decide what runs next.
+ */
+export class Runner {
+  readonly config: RunnerConfig;
+  readonly record: RunRecord;
+  readonly steps: StepRecord[] = [];
+  private nextIndex = 0;
+
+  constructor(config: RunnerConfig) {
+    this.config = config;
+    this.record = {
+      id: config.runId,
+      pipeline: config.pipeline,
+      status: 'running',
+      workspace: config.workspace,
+      input: config.input,
+      model: config.model,
+      startedAt: Date.now(),
+    };
+  }
+
+  /** Outputs of every step completed so far, in order. Feeds cache keys (ADR 0006). */
+  upstreamOutputs(): { name: string; output: unknown }[] {
+    return this.steps
+      .filter((s) => s.status === 'completed')
+      .map((s) => ({ name: s.name, output: s.output ?? s.text ?? null }));
+  }
+
+  async start(): Promise<void> {
+    await this.storage((s) => s.runStarted(this.record));
+    await this.emit((e) => e.runStarted?.(this.record));
+  }
+
+  /**
+   * Runs one step, recording it whatever happens. `work` receives the live record so
+   * a step kind can annotate it (exit code, session id, cache hit) before it finishes.
+   */
+  async execute<T>(
+    name: string,
+    kind: StepKind,
+    work: (step: StepRecord) => Promise<{ value: T; output?: unknown; text?: string }>,
+  ): Promise<T> {
+    this.throwIfAborted();
+    const step: StepRecord = {
+      id: crypto.randomUUID(),
+      runId: this.record.id,
+      index: this.nextIndex++,
+      name,
+      kind,
+      status: 'running',
+      startedAt: Date.now(),
+    };
+    this.steps.push(step);
+    await this.storage((s) => s.stepStarted(step));
+    await this.emit((e) => e.stepStarted?.(step));
+
+    try {
+      const result = await work(step);
+      step.status = 'completed';
+      if (result.output !== undefined) step.output = result.output;
+      if (result.text !== undefined) step.text = result.text;
+      await this.finishStep(step);
+      return result.value;
+    } catch (error) {
+      if (isHalt(error)) {
+        // A halt is not this step's failure; it is the run ending successfully.
+        step.status = 'completed';
+        await this.finishStep(step);
+        throw error;
+      }
+      step.status = 'failed';
+      step.error = messageOf(error);
+      await this.finishStep(step);
+      throw error instanceof StepFailedError ? error : new StepFailedError(name, error);
+    }
+  }
+
+  /** Records the declared steps a halt stopped the run from reaching. */
+  private async recordSkipped(): Promise<void> {
+    const ran = new Set(this.steps.map((s) => s.name));
+    for (const name of this.config.declaredSteps) {
+      if (ran.has(name)) continue;
+      const now = Date.now();
+      const step: StepRecord = {
+        id: crypto.randomUUID(),
+        runId: this.record.id,
+        index: -1,
+        name,
+        kind: 'code',
+        status: 'skipped',
+        startedAt: now,
+        finishedAt: now,
+        durationMs: 0,
+      };
+      this.steps.push(step);
+      await this.storage((s) => s.stepStarted(step));
+      await this.storage((s) => s.stepFinished(step));
+      await this.emit((e) => e.stepFinished?.(step));
+    }
+  }
+
+  async finish(outcome:
+    | { status: 'completed'; output: unknown }
+    | { status: 'halted'; reason: string }
+    | { status: 'failed'; error: unknown },
+  ): Promise<RunResult> {
+    if (outcome.status === 'halted') {
+      this.record.haltReason = outcome.reason;
+      await this.recordSkipped();
+    } else if (outcome.status === 'failed') {
+      this.record.error = messageOf(outcome.error);
+    } else {
+      this.record.output = outcome.output;
+    }
+    this.record.status = outcome.status as RunStatus;
+    this.record.finishedAt = Date.now();
+    this.record.durationMs = this.record.finishedAt - this.record.startedAt;
+
+    const result: RunResult = { ...this.record, steps: this.steps };
+    if (outcome.status === 'failed') result.cause = outcome.error;
+    await this.storage((s) => s.runFinished(this.record));
+    await this.emit((e) => e.runFinished?.(result));
+    await this.storage((s) => s.close?.());
+    return result;
+  }
+
+  private async finishStep(step: StepRecord): Promise<void> {
+    step.finishedAt = Date.now();
+    step.durationMs = step.finishedAt - step.startedAt;
+    await this.storage((s) => s.stepFinished(step));
+    await this.emit((e) => e.stepFinished?.(step));
+  }
+
+  throwIfAborted(): void {
+    if (this.config.signal?.aborted) {
+      throw new Error(`Run ${this.record.id} was aborted`);
+    }
+  }
+
+  /** Storage failures are the consumer's to see, so they propagate. */
+  private async storage(fn: (adapter: StorageAdapter) => Promise<void> | void): Promise<void> {
+    if (this.config.storage) await fn(this.config.storage);
+  }
+
+  /** A listener that throws must not take the run down with it. */
+  async emit(fn: (events: RunEvents) => void | Promise<void>): Promise<void> {
+    try {
+      await fn(this.config.events);
+    } catch (error) {
+      if (this.config.events.error) this.config.events.error(error);
+      else console.error('[claude-code-pipelines-sdk] event listener threw:', error);
+    }
+  }
+}
+
+export { HaltSignal };

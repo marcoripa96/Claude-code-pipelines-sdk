@@ -1,0 +1,31 @@
+{
+  "name": "@marcoripa96/claude-code-pipelines-sdk",
+  "version": "0.1.0",
+  "description": "Deterministic pipelines whose steps are Claude Code sessions, shell commands, or ordinary code.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "module": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": ["src", "README.md", "CONTEXT.md", "docs"],
+  "workspaces": ["examples"],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["claude", "claude-code", "agent-sdk", "pipeline", "bun"],
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.245"
+  },
+  "peerDependencies": {
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.7.0",
+    "zod": "^4.0.0"
+  }
+}

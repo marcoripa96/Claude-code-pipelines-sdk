@@ -1,0 +1,9 @@
+{
+  "name": "@marcoripa96/claude-code-pipelines-sdk-examples",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "zod": "^4.0.0"
+  }
+}
