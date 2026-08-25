@@ -36,12 +36,26 @@ export class RunContext<I = unknown> {
     this.runId = runner.record.id;
   }
 
-  /** Runs arbitrary code as a step. This is where External effects belong. */
-  step<T>(name: string, fn: () => T | Promise<T>): Promise<T> {
-    return this.runner.execute(name, 'code', async () => {
-      const value = await fn();
-      return { value, output: value };
-    });
+  /**
+   * Runs arbitrary code as a step. This is where External effects belong.
+   *
+   * `fn` is handed the step's abort signal; pass it to your own long-running work so
+   * a `timeout` or a cancelled run can stop it rather than merely stop waiting.
+   */
+  step<T>(
+    name: string,
+    fn: (signal: AbortSignal) => T | Promise<T>,
+    options: { timeout?: number } = {},
+  ): Promise<T> {
+    return this.runner.execute(
+      name,
+      'code',
+      async (_step, signal) => {
+        const value = await fn(signal);
+        return { value, output: value };
+      },
+      { timeout: options.timeout },
+    );
   }
 
   /**
@@ -56,7 +70,7 @@ export class RunContext<I = unknown> {
     options: ClaudeStepOptions<S> & { output: S },
   ): Promise<ClaudeHandle<Infer<S>>>;
   claude(options: ClaudeStepOptions<Schema | undefined>): Promise<ClaudeHandle<unknown>> {
-    return this.runner.execute(options.name, 'claude', async (step) => {
+    return this.runner.execute(options.name, 'claude', async (step, signal) => {
       const jsonSchema = options.output
         ? await toJsonSchema(options.name, options.output)
         : undefined;
@@ -91,7 +105,7 @@ export class RunContext<I = unknown> {
         step.cacheHit = false;
       }
 
-      const handle = await this.runClaudeStep(options, jsonSchema, step);
+      const handle = await this.runClaudeStep(options, jsonSchema, step, signal);
       if (key) {
         await this.runner.config.cache!.set(key, {
           output: handle.output,
@@ -100,7 +114,7 @@ export class RunContext<I = unknown> {
         });
       }
       return { value: handle, output: handle.output, text: handle.text };
-    });
+    }, { timeout: options.timeout });
   }
 
   /** @internal */
@@ -108,6 +122,7 @@ export class RunContext<I = unknown> {
     options: ClaudeStepOptions<Schema | undefined>,
     jsonSchema: Record<string, unknown> | undefined,
     step: StepRecord,
+    signal: AbortSignal,
   ): Promise<ClaudeHandle<unknown>> {
     const request: ClaudeRequest = {
       runId: this.runId,
@@ -124,7 +139,7 @@ export class RunContext<I = unknown> {
       skills: options.skills ?? 'all',
       settingSources: options.settingSources ?? ['project'],
       mcpServers: options.mcpServers,
-      signal: this.runner.config.signal,
+      signal,
     };
 
     const runClaude = this.runner.config.claude ?? (this.runner.claudeRunner ??= createClaudeRunner());
@@ -174,7 +189,7 @@ export class RunContext<I = unknown> {
   command(options: CommandStepOptions): Promise<CommandHandle> {
     const name = options.name ?? options.command;
     const cwd = options.cwd ?? this.workspace;
-    return this.runner.execute(name, 'command', async (step) => {
+    return this.runner.execute(name, 'command', async (step, signal) => {
       const key = await this.cacheKey(name, 'command', options.cache, stepConfig(options));
 
       if (key) {
@@ -188,13 +203,13 @@ export class RunContext<I = unknown> {
         step.cacheHit = false;
       }
 
-      const outcome = await runCommand(options, cwd);
+      const outcome = await runCommand(options, cwd, signal);
       step.exitCode = outcome.exitCode;
       assertCommandOk(options, outcome);
       if (key) await this.runner.config.cache!.set(key, outcome);
       const handle = commandHandle(name, outcome, step, false);
       return { value: handle, output: outcome };
-    });
+    }, { timeout: options.timeout });
   }
 
   /**
@@ -236,7 +251,10 @@ export class RunContext<I = unknown> {
  * out has to be a deliberate act, which is the safe direction for ADR 0006.
  */
 function stepConfig(options: object): Record<string, unknown> {
-  const { name: _name, cache: _cache, ...rest } = options as Record<string, unknown>;
+  // `timeout` joins name and cache in the deliberate exclusion list: how long a step is
+  // allowed to take does not change the result it produces, so two runs that differ only
+  // in a deadline should still share a cache entry.
+  const { name: _name, cache: _cache, timeout: _timeout, ...rest } = options as Record<string, unknown>;
   return rest;
 }
 

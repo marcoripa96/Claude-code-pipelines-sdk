@@ -133,6 +133,12 @@ export interface CacheOptions {
 interface StepOptionsBase {
   name?: string;
   cache?: CacheOptions;
+  /**
+   * Fail the step after this many milliseconds. Enforced by the runner, so it bounds
+   * every kind alike — a command step's process is killed, and a code step that never
+   * looks at its signal still fails on time.
+   */
+  timeout?: number;
 }
 
 export interface ClaudeStepOptions<S extends Schema | undefined = undefined>

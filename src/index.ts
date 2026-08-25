@@ -9,6 +9,7 @@ export { fake, session } from './fake.ts';
 export type { FakeRunner, Fixture, StepFixture } from './fake.ts';
 export type { CacheKeyParts } from './cache.ts';
 export type { SqliteStorage, SqliteStorageOptions } from './storage/sqlite.ts';
+export { StepTimeoutError } from './timeout.ts';
 export {
   ClaudeStepError,
   CommandFailedError,

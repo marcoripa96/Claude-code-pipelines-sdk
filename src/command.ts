@@ -1,4 +1,3 @@
-import { $ } from 'bun';
 import type { CommandHandle, CommandStepOptions, StepRecord } from './types.ts';
 import { CommandFailedError } from './errors.ts';
 import type { Runner } from './runner.ts';
@@ -9,19 +8,34 @@ export interface CommandOutcome {
   exitCode: number;
 }
 
-/** Runs one shell command under `Bun.$`, without throwing on a non-zero exit. */
+/**
+ * Runs one shell command, without throwing on a non-zero exit.
+ *
+ * Spawned rather than run through `Bun.$` because `$` exposes no way to cancel a
+ * running command: a step's `timeout` has to be able to kill the process, not just
+ * stop waiting for it. `signal` carries both the run's cancellation and that deadline.
+ */
 export async function runCommand(
   options: CommandStepOptions,
   cwd: string,
+  signal: AbortSignal,
 ): Promise<CommandOutcome> {
-  let shell = $`${{ raw: options.command }}`.cwd(cwd).quiet().nothrow();
-  if (options.env) shell = shell.env({ ...process.env, ...options.env });
-  const result = await shell;
-  return {
-    stdout: result.stdout.toString(),
-    stderr: result.stderr.toString(),
-    exitCode: result.exitCode,
-  };
+  const child = Bun.spawn(['sh', '-c', options.command], {
+    cwd,
+    env: options.env ? { ...process.env, ...options.env } : process.env,
+    stdout: 'pipe',
+    stderr: 'pipe',
+    signal,
+    // A command that ignores SIGTERM must not outlive the step that bounded it.
+    killSignal: 'SIGKILL',
+  });
+
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  return { stdout, stderr, exitCode };
 }
 
 export function commandHandle(

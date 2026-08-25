@@ -11,6 +11,7 @@ import type {
   StorageAdapter,
 } from './types.ts';
 import { HaltSignal, StepFailedError, isHalt, messageOf } from './errors.ts';
+import { NEVER_ABORTS, withTimeout } from './timeout.ts';
 
 /** Everything a run needs that is not specific to one step kind. */
 export interface RunnerConfig {
@@ -72,12 +73,15 @@ export class Runner {
 
   /**
    * Runs one step, recording it whatever happens. `work` receives the live record so
-   * a step kind can annotate it (exit code, session id, cache hit) before it finishes.
+   * a step kind can annotate it (exit code, session id, cache hit) before it finishes,
+   * and the signal it must do its work under — the run's, narrowed by this step's
+   * `timeout` when it declared one.
    */
   async execute<T>(
     name: string,
     kind: StepKind,
-    work: (step: StepRecord) => Promise<{ value: T; output?: unknown; text?: string }>,
+    work: (step: StepRecord, signal: AbortSignal) => Promise<{ value: T; output?: unknown; text?: string }>,
+    options: { timeout?: number } = {},
   ): Promise<T> {
     this.throwIfAborted();
     const step: StepRecord = {
@@ -94,7 +98,9 @@ export class Runner {
     await this.emit((e) => e.stepStarted?.(step));
 
     try {
-      const result = await work(step);
+      const result = await withTimeout(name, options.timeout, this.config.signal ?? NEVER_ABORTS, (signal) =>
+        work(step, signal),
+      );
       step.status = 'completed';
       if (result.output !== undefined) step.output = result.output;
       if (result.text !== undefined) step.text = result.text;
