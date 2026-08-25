@@ -1,3 +1,4 @@
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import type {
   CacheAdapter,
   ClaudeRunner,
@@ -35,6 +36,8 @@ export class Runner {
   readonly record: RunRecord;
   readonly steps: StepRecord[] = [];
   private nextIndex = 0;
+  /** The default runner, created once per run and only if a Claude step needs it. */
+  claudeRunner?: ClaudeRunner;
 
   constructor(config: RunnerConfig) {
     this.config = config;
@@ -54,6 +57,12 @@ export class Runner {
     return this.steps
       .filter((s) => s.status === 'completed')
       .map((s) => ({ name: s.name, output: s.output ?? s.text ?? null }));
+  }
+
+  /** Fans one of Claude's messages out to storage and to the `message` event, verbatim. */
+  async message(step: StepRecord, message: SDKMessage): Promise<void> {
+    await this.storage((s) => s.messageAppended(step.id, message));
+    await this.emit((e) => e.message?.(message, step));
   }
 
   async start(): Promise<void> {

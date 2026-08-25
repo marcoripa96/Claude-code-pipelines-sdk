@@ -1,7 +1,16 @@
 import type { Runner } from './runner.ts';
-import type { CommandHandle, CommandStepOptions } from './types.ts';
+import type {
+  ClaudeHandle,
+  ClaudeRequest,
+  ClaudeStepOptions,
+  CommandHandle,
+  CommandStepOptions,
+  Infer,
+  Schema,
+} from './types.ts';
 import { assertCommandOk, commandHandle, runCommand } from './command.ts';
-import { HaltSignal } from './errors.ts';
+import { ClaudeStepError, HaltSignal, isHalt } from './errors.ts';
+import { createClaudeRunner } from './claude.ts';
 
 /**
  * What a pipeline's `run` function is handed. Every method here records a step;
@@ -32,6 +41,85 @@ export class RunContext<I = unknown> {
   }
 
   /**
+   * Runs one Claude session as a step. The session is always fresh; it never
+   * inherits another step's conversation.
+   *
+   * Declaring `output` turns the session's answer into a schema-validated Output,
+   * which is the only channel by which a session communicates a decision.
+   */
+  claude(options: ClaudeStepOptions<undefined>): Promise<ClaudeHandle<undefined>>;
+  claude<S extends Schema>(
+    options: ClaudeStepOptions<S> & { output: S },
+  ): Promise<ClaudeHandle<Infer<S>>>;
+  claude(options: ClaudeStepOptions<Schema | undefined>): Promise<ClaudeHandle<unknown>> {
+    return this.runner.execute(options.name, 'claude', async (step) => {
+      const handle = await this.runClaudeStep(options, step);
+      return { value: handle, output: handle.output, text: handle.text };
+    });
+  }
+
+  /** @internal */
+  private async runClaudeStep(
+    options: ClaudeStepOptions<Schema | undefined>,
+    step: import('./types.ts').StepRecord,
+  ): Promise<ClaudeHandle<unknown>> {
+    const request: ClaudeRequest = {
+      stepName: options.name,
+      prompt: options.prompt,
+      jsonSchema: options.output ? await toJsonSchema(options.name, options.output) : undefined,
+      model: options.model ?? this.runner.config.model,
+      cwd: options.cwd ?? this.workspace,
+      maxTurns: options.maxTurns,
+      allowedTools: options.allowedTools,
+      disallowedTools: options.disallowedTools,
+      permissionMode: options.permissionMode ?? 'bypassPermissions',
+      skills: options.skills ?? 'all',
+      settingSources: options.settingSources ?? ['project'],
+      mcpServers: options.mcpServers,
+      signal: this.runner.config.signal,
+    };
+
+    const runClaude = this.runner.config.claude ?? (this.runner.claudeRunner ??= createClaudeRunner());
+    const attempts = Math.max(0, options.retry ?? 0) + 1;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      this.runner.throwIfAborted();
+      step.attempts = attempt;
+      let pending: Promise<void> = Promise.resolve();
+      try {
+        const response = await runClaude(request, (message) => {
+          pending = pending.then(() => this.runner.message(step, message));
+        });
+        await pending;
+
+        let output: unknown;
+        if (options.output) {
+          if (response.structuredOutput === undefined) {
+            throw new Error('session produced no structured_output');
+          }
+          output = options.output.parse(response.structuredOutput);
+        }
+        step.sessionId = response.sessionId;
+        return {
+          name: options.name,
+          output,
+          text: response.text,
+          sessionId: response.sessionId,
+          cacheHit: false,
+          step,
+        };
+      } catch (error) {
+        await pending.catch(() => {});
+        if (isHalt(error)) throw error;
+        lastError = error;
+      }
+    }
+
+    throw new ClaudeStepError(options.name, attempts, lastError);
+  }
+
+  /**
    * Runs a shell command as a step. Throws on a non-zero exit unless the step
    * declared `allowFailure`, in which case the handle carries the exit code.
    */
@@ -53,5 +141,22 @@ export class RunContext<I = unknown> {
    */
   halt(reason: string): never {
     throw new HaltSignal(reason);
+  }
+}
+
+/**
+ * Zod is a peer dependency, imported only when a step declares an Output schema,
+ * so pipelines without one do not need it loaded.
+ */
+async function toJsonSchema(stepName: string, schema: object): Promise<Record<string, unknown>> {
+  const { toJSONSchema } = await import('zod');
+  try {
+    return toJSONSchema(schema as never, { io: 'output' }) as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(
+      `Output schema for step "${stepName}" cannot be expressed as JSON Schema: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
 }

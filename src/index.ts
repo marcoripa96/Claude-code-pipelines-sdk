@@ -1,6 +1,7 @@
 export { definePipeline } from './pipeline.ts';
 export type { Pipeline, PipelineDefinition, RunOptions } from './pipeline.ts';
 export { RunContext } from './context.ts';
+export { createClaudeRunner } from './claude.ts';
 export {
   ClaudeStepError,
   CommandFailedError,
