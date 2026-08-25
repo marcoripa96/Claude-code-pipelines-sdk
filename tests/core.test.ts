@@ -41,7 +41,7 @@ describe('core runner', () => {
       run: (ctx) => ctx.input.issueId,
     });
 
-    expect(pipeline.run({ input: { issueId: 'nope' } as never })).rejects.toThrow(
+    await expect(pipeline.run({ input: { issueId: 'nope' } as never })).rejects.toThrow(
       PipelineInputError,
     );
   });

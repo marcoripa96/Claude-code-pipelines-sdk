@@ -132,6 +132,11 @@ database, implement the adapter against it rather than running a second store be
 (ADR 0003); the default `sqliteStorage()` keeps `runs`, `steps` and `messages` tables in
 a `bun:sqlite` file, which you then query with your own SQL.
 
+One adapter serves any number of runs, and the SDK never closes the database — it does
+not know when you are finished with it, so call `storage.db.close()` yourself. A run id
+must be unique: pass your own `runId` and a duplicate is reported rather than merged
+into the existing row.
+
 Storage is history, not the live view. Live progress comes from `on`, because the
 application watching a run is the process running it.
 
@@ -143,8 +148,9 @@ Steps are never cacheable by default. A step opts in, and the run supplies an ad
 await ctx.claude({ name: 'analyze', prompt, output, cache: { inputs: ['package.json', 'src/**'] } });
 ```
 
-The key hashes the step's configuration, the contents of its declared input files, the
-pipeline's input, every upstream step's Output, and the model name. That deliberately
+`inputs` takes file paths, glob patterns, or a directory, which is read as everything
+beneath it. The key hashes the step's configuration, the contents of its declared input
+files, the pipeline's input, every upstream step's Output, and the model name. That deliberately
 over-invalidates (ADR 0006): re-running costs a session, while a silently stale hit costs
 an afternoon. `memoryCache()` and `sqliteCache()` are included; `CacheAdapter` is two
 methods if you want your own.

@@ -7,12 +7,13 @@ export interface SqliteStorageOptions {
   path?: string;
   /** An already-open database to write into, instead of opening one. */
   database?: Database;
-  /** Close the database when the run finishes. Default `true` unless `database` was given. */
-  closeOnFinish?: boolean;
 }
 
 export interface SqliteStorage extends StorageAdapter {
-  /** The underlying database. Reads are yours to write, in your own SQL. */
+  /**
+   * The underlying database. Reads are yours to write, in your own SQL, and so is
+   * closing it — an adapter outlives the runs written through it.
+   */
   readonly db: Database;
 }
 
@@ -67,17 +68,20 @@ CREATE INDEX IF NOT EXISTS messages_step_id ON messages(step_id);
  *
  * Write-only and append-or-update; it never deletes anything. Retention is yours,
  * and so are reads — this is a store you can point your own SQL at (ADR 0003).
+ *
+ * One adapter serves any number of runs. It does not close the database, because it
+ * does not know when you are finished with it; call `storage.db.close()` yourself.
  */
 export function sqliteStorage(options: SqliteStorageOptions | string = {}): SqliteStorage {
   const config = typeof options === 'string' ? { path: options } : options;
   const db = config.database ?? openDatabase(config.path ?? '.pipelines/runs.sqlite');
   db.run(SCHEMA);
-  const closeOnFinish = config.closeOnFinish ?? config.database === undefined;
 
+  // A plain insert: a run id that is already recorded is a mistake worth hearing about,
+  // not two runs to be merged into one row with interleaved steps.
   const insertRun = db.query(`
     INSERT INTO runs (id, pipeline, status, workspace, input, model, started_at)
     VALUES ($id, $pipeline, $status, $workspace, $input, $model, $started_at)
-    ON CONFLICT(id) DO UPDATE SET status = excluded.status
   `);
   const updateRun = db.query(`
     UPDATE runs SET status = $status, finished_at = $finished_at, duration_ms = $duration_ms,
@@ -87,7 +91,6 @@ export function sqliteStorage(options: SqliteStorageOptions | string = {}): Sqli
   const insertStep = db.query(`
     INSERT INTO steps (id, run_id, idx, name, kind, status, started_at)
     VALUES ($id, $run_id, $idx, $name, $kind, $status, $started_at)
-    ON CONFLICT(id) DO UPDATE SET status = excluded.status
   `);
   const updateStep = db.query(`
     UPDATE steps SET status = $status, finished_at = $finished_at, duration_ms = $duration_ms,
@@ -105,15 +108,22 @@ export function sqliteStorage(options: SqliteStorageOptions | string = {}): Sqli
   return {
     db,
     runStarted(run: RunRecord) {
-      insertRun.run({
-        $id: run.id,
-        $pipeline: run.pipeline,
-        $status: run.status,
-        $workspace: run.workspace,
-        $input: json(run.input),
-        $model: run.model ?? null,
-        $started_at: run.startedAt,
-      });
+      try {
+        insertRun.run({
+          $id: run.id,
+          $pipeline: run.pipeline,
+          $status: run.status,
+          $workspace: run.workspace,
+          $input: json(run.input),
+          $model: run.model ?? null,
+          $started_at: run.startedAt,
+        });
+      } catch (error) {
+        throw new Error(
+          `A run with id ${run.id} is already recorded; a run id must be unique.`,
+          { cause: error },
+        );
+      }
     },
     runFinished(run: RunRecord) {
       updateRun.run({
@@ -163,9 +173,6 @@ export function sqliteStorage(options: SqliteStorageOptions | string = {}): Sqli
         $body: json(message) ?? 'null',
         $created_at: Date.now(),
       });
-    },
-    close() {
-      if (closeOnFinish) db.close();
     },
   };
 }

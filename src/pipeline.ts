@@ -82,10 +82,12 @@ export function definePipeline<S extends Schema | undefined = undefined, O = unk
         signal: options.signal,
       });
 
-      await runner.start();
       const ctx = new RunContext(runner, input as never);
 
       try {
+        // Inside the try: an adapter that throws on runStarted is a failed run like
+        // any other, not an exception escaping a call documented to resolve.
+        await runner.start();
         const output = await definition.run(ctx as never);
         return (await runner.finish({ status: 'completed', output })) as RunResult<O>;
       } catch (error) {

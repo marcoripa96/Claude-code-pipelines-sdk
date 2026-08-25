@@ -112,8 +112,6 @@ export interface StorageAdapter {
   messageAppended(stepId: string, message: SDKMessage): Promise<void> | void;
   stepFinished(step: StepRecord): Promise<void> | void;
   runFinished(run: RunRecord): Promise<void> | void;
-  /** Optional teardown, called when a run finishes if the adapter defines it. */
-  close?(): Promise<void> | void;
 }
 
 /** A small keyed store. Separate from storage because caching must read back what it wrote. */
@@ -192,6 +190,10 @@ export interface CommandHandle {
 
 /** One `query()` against the Agent SDK, as the runner asks for it. */
 export interface ClaudeRequest {
+  /** The run this session belongs to. */
+  runId: string;
+  /** The step record this session belongs to. A retried step keeps the same id. */
+  stepId: string;
   stepName: string;
   prompt: string;
   /** `z.toJSONSchema(output)` when a schema was declared. */

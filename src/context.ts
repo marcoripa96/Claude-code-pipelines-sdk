@@ -61,18 +61,13 @@ export class RunContext<I = unknown> {
         ? await toJsonSchema(options.name, options.output)
         : undefined;
 
+      // Derived from the options themselves rather than a hand-written list, so a
+      // field added to ClaudeStepOptions cannot quietly fall out of the key.
       const key = await this.cacheKey(options.name, 'claude', options.cache, {
-        prompt: options.prompt,
+        ...stepConfig(options),
+        output: undefined,
         jsonSchema,
-        retry: options.retry,
         model: options.model ?? this.runner.config.model,
-        cwd: options.cwd,
-        maxTurns: options.maxTurns,
-        allowedTools: options.allowedTools,
-        disallowedTools: options.disallowedTools,
-        permissionMode: options.permissionMode,
-        skills: options.skills,
-        settingSources: options.settingSources,
       });
 
       if (key) {
@@ -115,6 +110,8 @@ export class RunContext<I = unknown> {
     step: StepRecord,
   ): Promise<ClaudeHandle<unknown>> {
     const request: ClaudeRequest = {
+      runId: this.runId,
+      stepId: step.id,
       stepName: options.name,
       prompt: options.prompt,
       jsonSchema,
@@ -178,12 +175,7 @@ export class RunContext<I = unknown> {
     const name = options.name ?? options.command;
     const cwd = options.cwd ?? this.workspace;
     return this.runner.execute(name, 'command', async (step) => {
-      const key = await this.cacheKey(name, 'command', options.cache, {
-        command: options.command,
-        allowFailure: options.allowFailure,
-        cwd: options.cwd,
-        env: options.env,
-      });
+      const key = await this.cacheKey(name, 'command', options.cache, stepConfig(options));
 
       if (key) {
         step.cacheKey = key;
@@ -236,6 +228,16 @@ export class RunContext<I = unknown> {
   halt(reason: string): never {
     throw new HaltSignal(reason);
   }
+}
+
+/**
+ * Everything a step declared except its identity and its own cache declaration.
+ * Spreading the options means a new option is part of the key by default; leaving one
+ * out has to be a deliberate act, which is the safe direction for ADR 0006.
+ */
+function stepConfig(options: object): Record<string, unknown> {
+  const { name: _name, cache: _cache, ...rest } = options as Record<string, unknown>;
+  return rest;
 }
 
 /**

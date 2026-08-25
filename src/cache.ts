@@ -1,4 +1,5 @@
 import { Database } from 'bun:sqlite';
+import { statSync } from 'node:fs';
 import type { CacheAdapter } from './types.ts';
 
 /** Everything a cacheable step's key covers. See ADR 0006 — this deliberately over-invalidates. */
@@ -41,20 +42,18 @@ export async function computeCacheKey(parts: CacheKeyParts): Promise<string> {
   return hasher.digest('hex');
 }
 
-/** Contents of every declared input file, keyed by path. A missing file hashes as absent. */
+/**
+ * Contents of every declared input file, keyed by path. A glob is expanded, a
+ * directory is expanded as everything beneath it, and a path that is not there yet
+ * hashes as absent — so the file appearing later changes the key.
+ */
 async function hashInputFiles(
   workspace: string,
   patterns: string[],
 ): Promise<Record<string, string>> {
   const paths = new Set<string>();
   for (const pattern of patterns) {
-    if (isGlob(pattern)) {
-      for await (const match of new Bun.Glob(pattern).scan({ cwd: workspace, dot: true })) {
-        paths.add(match);
-      }
-    } else {
-      paths.add(pattern);
-    }
+    for await (const path of expand(workspace, pattern)) paths.add(path);
   }
 
   const hashes: Record<string, string> = {};
@@ -67,24 +66,99 @@ async function hashInputFiles(
   return hashes;
 }
 
+async function* expand(workspace: string, pattern: string): AsyncGenerator<string> {
+  if (isGlob(pattern)) {
+    yield* new Bun.Glob(pattern).scan({ cwd: workspace, dot: true });
+    return;
+  }
+  // A bare directory is what someone means by `inputs: ['src']`; hashing it as one
+  // absent file would make the whole declaration a silent no-op.
+  if (isDirectory(`${workspace}/${pattern}`)) {
+    const inside = pattern.replace(/\/+$/, '');
+    yield* new Bun.Glob(`${inside}/**`).scan({ cwd: workspace, dot: true });
+    return;
+  }
+  yield pattern;
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function isGlob(pattern: string): boolean {
   return /[*?[\]{}]/.test(pattern);
 }
 
-/** Key order must not change the hash, so objects are serialised with sorted keys. */
+/**
+ * Key order must not change the hash, so objects are serialised with sorted keys.
+ *
+ * Values `JSON.stringify` would flatten are tagged instead: a `Date`, a `Map`, a `Set`
+ * and a bare `{}` must not hash alike, because two different values sharing a key is
+ * the stale-hit failure ADR 0006 exists to avoid.
+ */
 export function stableStringify(value: unknown): string {
-  return JSON.stringify(normalise(value));
+  return JSON.stringify(normalise(value, new Set())) ?? 'undefined';
 }
 
-function normalise(value: unknown): unknown {
-  if (value === null || typeof value !== 'object') {
-    return typeof value === 'bigint' ? `${value}n` : value;
+function normalise(value: unknown, seen: Set<object>): unknown {
+  if (typeof value === 'bigint') return tag('BigInt', `${value}`);
+  if (typeof value === 'symbol') return tag('Symbol', String(value));
+  if (typeof value === 'function') return tag('Function', value.name || 'anonymous');
+  if (typeof value === 'number' && !Number.isFinite(value)) return tag('Number', String(value));
+  if (typeof value !== 'object' || value === null) return value;
+
+  if (seen.has(value)) {
+    throw new Error(
+      'Cannot compute a cache key for a value that references itself. Declare a ' +
+        'cacheable step\'s inputs as plain data, or drop `cache` from the step.',
+    );
   }
-  if (Array.isArray(value)) return value.map(normalise);
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, v]) => v !== undefined)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return Object.fromEntries(entries.map(([k, v]) => [k, normalise(v)]));
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) return value.map((entry) => normalise(entry, seen));
+    if (value instanceof Date) return tag('Date', value.toISOString());
+    if (value instanceof RegExp) return tag('RegExp', `${value.source}/${value.flags}`);
+    if (value instanceof URL) return tag('URL', value.href);
+    if (value instanceof Map) {
+      return tag(
+        'Map',
+        [...value.entries()]
+          .map(([k, v]) => [normalise(k, seen), normalise(v, seen)])
+          .sort(compareSerialised),
+      );
+    }
+    if (value instanceof Set) {
+      return tag('Set', [...value].map((entry) => normalise(entry, seen)).sort(compareSerialised));
+    }
+    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+      return tag('Bytes', new Bun.CryptoHasher('sha256').update(value as never).digest('hex'));
+    }
+
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => [k, normalise(v, seen)] as const);
+    const plain = Object.fromEntries(entries);
+
+    // Two class instances with the same fields are still two different values.
+    const name = value.constructor?.name;
+    return name && name !== 'Object' ? tag(name, plain) : plain;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function tag(type: string, value: unknown): Record<string, unknown> {
+  return { '~type': type, value };
+}
+
+function compareSerialised(a: unknown, b: unknown): number {
+  const [x, y] = [JSON.stringify(a) ?? '', JSON.stringify(b) ?? ''];
+  return x < y ? -1 : x > y ? 1 : 0;
 }
 
 /** An in-process cache. Useful in tests and for a single long-lived process. */

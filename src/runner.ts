@@ -133,6 +133,9 @@ export class Runner {
       };
       this.steps.push(step);
       await this.storage((s) => s.stepStarted(step));
+      // Emitted as a pair, so every stepFinished a listener sees has a stepStarted
+      // before it. Both carry status 'skipped', which is how a listener tells.
+      await this.emit((e) => e.stepStarted?.(step));
       await this.storage((s) => s.stepFinished(step));
       await this.emit((e) => e.stepFinished?.(step));
     }
@@ -159,7 +162,6 @@ export class Runner {
     if (outcome.status === 'failed') result.cause = outcome.error;
     await this.storage((s) => s.runFinished(this.record));
     await this.emit((e) => e.runFinished?.(result));
-    await this.storage((s) => s.close?.());
     return result;
   }
 
@@ -181,14 +183,29 @@ export class Runner {
     if (this.config.storage) await fn(this.config.storage);
   }
 
-  /** A listener that throws must not take the run down with it. */
+  /** A listener that throws must not take the run down with it — including this one. */
   async emit(fn: (events: RunEvents) => void | Promise<void>): Promise<void> {
     try {
       await fn(this.config.events);
     } catch (error) {
-      if (this.config.events.error) this.config.events.error(error);
-      else console.error('[claude-code-pipelines-sdk] event listener threw:', error);
+      report(this.config.events, error);
     }
+  }
+}
+
+function report(events: RunEvents, error: unknown): void {
+  if (!events.error) {
+    console.error('[claude-code-pipelines-sdk] event listener threw:', error);
+    return;
+  }
+  try {
+    events.error(error);
+  } catch (reportingError) {
+    console.error(
+      '[claude-code-pipelines-sdk] the error listener threw while reporting:',
+      reportingError,
+    );
+    console.error('[claude-code-pipelines-sdk] the error it was reporting:', error);
   }
 }
 

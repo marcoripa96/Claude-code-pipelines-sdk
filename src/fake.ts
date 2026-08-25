@@ -62,9 +62,11 @@ export function fake(fixtures: Record<string, StepFixture>): FakeRunner {
       );
     }
 
+    // Keyed by the step execution rather than the step name, so a list of fixtures
+    // feeds one step's attempts and a second run starts from the first entry again.
     const declared = fixtures[request.stepName]!;
-    const attempt = attempts.get(request.stepName) ?? 0;
-    attempts.set(request.stepName, attempt + 1);
+    const attempt = attempts.get(request.stepId) ?? 0;
+    attempts.set(request.stepId, attempt + 1);
 
     let fixture: Fixture;
     if (Array.isArray(declared)) {

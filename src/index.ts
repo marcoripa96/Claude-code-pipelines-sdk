@@ -2,6 +2,7 @@ export { definePipeline } from './pipeline.ts';
 export type { Pipeline, PipelineDefinition, RunOptions } from './pipeline.ts';
 export { RunContext } from './context.ts';
 export { createClaudeRunner } from './claude.ts';
+export type { ClaudeRunnerDeps } from './claude.ts';
 export { sqliteStorage } from './storage/sqlite.ts';
 export { computeCacheKey, memoryCache, sqliteCache } from './cache.ts';
 export { fake, session } from './fake.ts';

@@ -14,7 +14,13 @@ import type { ClaudeRequest, ClaudeResponse, ClaudeRunner } from './types.ts';
  * message's `structured_output` — see ADR 0002. The SDK carries its own retry loop
  * inside that; `retry` on the step wraps whole sessions around it.
  */
-export function createClaudeRunner(): ClaudeRunner {
+export interface ClaudeRunnerDeps {
+  /** The Agent SDK's `query`. Injectable so the runner's own edges are testable. */
+  query?: typeof query;
+}
+
+export function createClaudeRunner(deps: ClaudeRunnerDeps = {}): ClaudeRunner {
+  const runQuery = deps.query ?? query;
   return async function runClaude(
     request: ClaudeRequest,
     onMessage: (message: SDKMessage) => void,
@@ -38,17 +44,27 @@ export function createClaudeRunner(): ClaudeRunner {
     if (request.jsonSchema) {
       options.outputFormat = { type: 'json_schema', schema: request.jsonSchema };
     }
+    // Tracked so it can come off again: a run's signal outlives each of its steps,
+    // and a pipeline of many Claude steps would otherwise pile listeners onto it.
+    let detach: (() => void) | undefined;
     if (request.signal) {
+      const signal = request.signal;
       const controller = new AbortController();
-      request.signal.addEventListener('abort', () => controller.abort(), { once: true });
-      if (request.signal.aborted) controller.abort();
+      const abort = () => controller.abort();
+      signal.addEventListener('abort', abort, { once: true });
+      detach = () => signal.removeEventListener('abort', abort);
+      if (signal.aborted) controller.abort();
       options.abortController = controller;
     }
 
     let result: SDKResultMessage | undefined;
-    for await (const message of query({ prompt: request.prompt, options })) {
-      onMessage(message);
-      if (message.type === 'result') result = message;
+    try {
+      for await (const message of runQuery({ prompt: request.prompt, options })) {
+        onMessage(message);
+        if (message.type === 'result') result = message;
+      }
+    } finally {
+      detach?.();
     }
 
     if (!result) {
