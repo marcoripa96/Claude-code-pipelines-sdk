@@ -44,6 +44,8 @@ describe('claude steps', () => {
     expect(result.steps[0]!.output).toEqual({ type: 'bug', labels: ['bug'] });
     expect(requests[0]!.jsonSchema).toBeDefined();
     expect(requests[0]!.jsonSchema!.type).toBe('object');
+    // The CLI rejects a schema carrying the 2020-12 meta-schema URL it cannot resolve.
+    expect(requests[0]!.jsonSchema).not.toHaveProperty('$schema');
   });
 
   test('without a schema the handle carries the final text', async () => {

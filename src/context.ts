@@ -245,7 +245,11 @@ export class RunContext<I = unknown> {
 async function toJsonSchema(stepName: string, schema: object): Promise<Record<string, unknown>> {
   const { toJSONSchema } = await import('zod');
   try {
-    return toJSONSchema(schema as never, { io: 'output' }) as Record<string, unknown>;
+    const json = toJSONSchema(schema as never, { io: 'output' }) as Record<string, unknown>;
+    // The CLI validates the schema with a resolver that does not know the 2020-12
+    // meta-schema by URL, and rejects it outright. The dialect is implicit anyway.
+    delete json.$schema;
+    return json;
   } catch (error) {
     throw new Error(
       `Output schema for step "${stepName}" cannot be expressed as JSON Schema: ${

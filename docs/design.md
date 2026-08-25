@@ -91,7 +91,9 @@ Sessions are always fresh: a Claude step never inherits another step's conversat
 Each `claude()` step is one `query()` against `@anthropic-ai/claude-agent-sdk`:
 
 - `outputFormat: { type: 'json_schema', schema: z.toJSONSchema(output) }` when a schema is
-  declared, read back off the result's `structured_output`
+  declared, read back off the result's `structured_output`. The `$schema` key Zod emits is
+  removed first: the CLI validates the schema with a resolver that does not know the
+  2020-12 meta-schema by URL and rejects it outright.
 - `settingSources: ['project']` so `CLAUDE.md` and project skills load
 - `skills: 'all'` — skills are simply available, and the prompt says which to use
   (`/classify-issue`), matching how Claude Code is used interactively
