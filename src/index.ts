@@ -3,6 +3,8 @@ export type { Pipeline, PipelineDefinition, RunOptions } from './pipeline.ts';
 export { RunContext } from './context.ts';
 export { createClaudeRunner } from './claude.ts';
 export { sqliteStorage } from './storage/sqlite.ts';
+export { computeCacheKey, memoryCache, sqliteCache } from './cache.ts';
+export type { CacheKeyParts } from './cache.ts';
 export type { SqliteStorage, SqliteStorageOptions } from './storage/sqlite.ts';
 export {
   ClaudeStepError,

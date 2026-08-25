@@ -3,14 +3,18 @@ import type {
   ClaudeHandle,
   ClaudeRequest,
   ClaudeStepOptions,
+  CacheOptions,
   CommandHandle,
   CommandStepOptions,
   Infer,
   Schema,
+  StepRecord,
 } from './types.ts';
+import type { CommandOutcome } from './command.ts';
 import { assertCommandOk, commandHandle, runCommand } from './command.ts';
 import { ClaudeStepError, HaltSignal, isHalt } from './errors.ts';
 import { createClaudeRunner } from './claude.ts';
+import { computeCacheKey } from './cache.ts';
 
 /**
  * What a pipeline's `run` function is handed. Every method here records a step;
@@ -53,7 +57,53 @@ export class RunContext<I = unknown> {
   ): Promise<ClaudeHandle<Infer<S>>>;
   claude(options: ClaudeStepOptions<Schema | undefined>): Promise<ClaudeHandle<unknown>> {
     return this.runner.execute(options.name, 'claude', async (step) => {
-      const handle = await this.runClaudeStep(options, step);
+      const jsonSchema = options.output
+        ? await toJsonSchema(options.name, options.output)
+        : undefined;
+
+      const key = await this.cacheKey(options.name, 'claude', options.cache, {
+        prompt: options.prompt,
+        jsonSchema,
+        retry: options.retry,
+        model: options.model ?? this.runner.config.model,
+        cwd: options.cwd,
+        maxTurns: options.maxTurns,
+        allowedTools: options.allowedTools,
+        disallowedTools: options.disallowedTools,
+        permissionMode: options.permissionMode,
+        skills: options.skills,
+        settingSources: options.settingSources,
+      });
+
+      if (key) {
+        step.cacheKey = key;
+        const hit = (await this.runner.config.cache!.get(key)) as
+          | { output?: unknown; text: string; sessionId?: string }
+          | undefined;
+        if (hit !== undefined) {
+          step.cacheHit = true;
+          step.sessionId = hit.sessionId;
+          const handle: ClaudeHandle<unknown> = {
+            name: options.name,
+            output: hit.output,
+            text: hit.text,
+            sessionId: hit.sessionId,
+            cacheHit: true,
+            step,
+          };
+          return { value: handle, output: handle.output, text: handle.text };
+        }
+        step.cacheHit = false;
+      }
+
+      const handle = await this.runClaudeStep(options, jsonSchema, step);
+      if (key) {
+        await this.runner.config.cache!.set(key, {
+          output: handle.output,
+          text: handle.text,
+          sessionId: handle.sessionId,
+        });
+      }
       return { value: handle, output: handle.output, text: handle.text };
     });
   }
@@ -61,12 +111,13 @@ export class RunContext<I = unknown> {
   /** @internal */
   private async runClaudeStep(
     options: ClaudeStepOptions<Schema | undefined>,
-    step: import('./types.ts').StepRecord,
+    jsonSchema: Record<string, unknown> | undefined,
+    step: StepRecord,
   ): Promise<ClaudeHandle<unknown>> {
     const request: ClaudeRequest = {
       stepName: options.name,
       prompt: options.prompt,
-      jsonSchema: options.output ? await toJsonSchema(options.name, options.output) : undefined,
+      jsonSchema,
       model: options.model ?? this.runner.config.model,
       cwd: options.cwd ?? this.workspace,
       maxTurns: options.maxTurns,
@@ -127,11 +178,54 @@ export class RunContext<I = unknown> {
     const name = options.name ?? options.command;
     const cwd = options.cwd ?? this.workspace;
     return this.runner.execute(name, 'command', async (step) => {
+      const key = await this.cacheKey(name, 'command', options.cache, {
+        command: options.command,
+        allowFailure: options.allowFailure,
+        cwd: options.cwd,
+        env: options.env,
+      });
+
+      if (key) {
+        step.cacheKey = key;
+        const hit = (await this.runner.config.cache!.get(key)) as CommandOutcome | undefined;
+        if (hit !== undefined) {
+          step.cacheHit = true;
+          step.exitCode = hit.exitCode;
+          return { value: commandHandle(name, hit, step, true), output: hit };
+        }
+        step.cacheHit = false;
+      }
+
       const outcome = await runCommand(options, cwd);
       step.exitCode = outcome.exitCode;
       assertCommandOk(options, outcome);
+      if (key) await this.runner.config.cache!.set(key, outcome);
       const handle = commandHandle(name, outcome, step, false);
       return { value: handle, output: outcome };
+    });
+  }
+
+  /**
+   * A key for a cacheable step, or `undefined` when the step did not opt in or the
+   * run has no cache adapter. Steps are never cacheable by default.
+   */
+  private async cacheKey(
+    stepName: string,
+    kind: string,
+    cache: CacheOptions | undefined,
+    config: Record<string, unknown>,
+  ): Promise<string | undefined> {
+    if (!cache || !this.runner.config.cache) return undefined;
+    return computeCacheKey({
+      pipeline: this.runner.config.pipeline,
+      stepName,
+      kind,
+      config,
+      inputs: cache.inputs ?? [],
+      workspace: this.workspace,
+      pipelineInput: this.input,
+      upstream: this.runner.upstreamOutputs(),
+      model: this.runner.config.model ?? 'default',
     });
   }
 
