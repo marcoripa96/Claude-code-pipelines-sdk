@@ -50,7 +50,18 @@ export class RunContext<I = unknown> {
   ): Promise<T> {
     return this.runner.execute(
       this.runner.beginStep(name, 'code'),
-      async (_step, signal) => {
+      async (record, signal) => {
+        // A code step is where External effects live, so replaying one is the point:
+        // a resumed run must not post the comment or open the pull request twice.
+        // Its source is part of the identity — edit the function and it runs again.
+        const fingerprint = await this.fingerprint(name, 'code', undefined, {
+          source: fn.toString(),
+        });
+        record.fingerprint = fingerprint;
+
+        const recalled = await this.recall(record, fingerprint, false, (prior) => prior.output);
+        if (recalled) return { value: recalled.value as T, output: recalled.value };
+
         const value = await fn(signal);
         return { value, output: value };
       },
@@ -77,37 +88,43 @@ export class RunContext<I = unknown> {
 
       // Derived from the options themselves rather than a hand-written list, so a
       // field added to ClaudeStepOptions cannot quietly fall out of the key.
-      const key = await this.cacheKey(options.name, 'claude', options.cache, {
+      const cacheable = this.cacheable(options.cache);
+      const fingerprint = await this.fingerprint(options.name, 'claude', options.cache, {
         ...stepConfig(options),
         output: undefined,
         jsonSchema,
         model: options.model ?? this.runner.config.model,
       });
-
-      if (key) {
-        step.cacheKey = key;
-        const hit = (await this.runner.config.cache!.get(key)) as
-          | { output?: unknown; text: string; sessionId?: string }
-          | undefined;
-        if (hit !== undefined) {
-          step.cacheHit = true;
-          step.sessionId = hit.sessionId;
-          const handle: ClaudeHandle<unknown> = {
-            name: options.name,
-            output: hit.output,
-            text: hit.text,
-            sessionId: hit.sessionId,
-            cacheHit: true,
-            step,
-          };
-          return { value: handle, output: handle.output, text: handle.text };
-        }
+      step.fingerprint = fingerprint;
+      if (cacheable) {
+        step.cacheKey = fingerprint;
         step.cacheHit = false;
       }
 
+      const recalled = await this.recall(step, fingerprint, cacheable, (prior) => ({
+        output: prior.output,
+        text: prior.text ?? '',
+        sessionId: prior.sessionId,
+      }));
+
+      if (recalled) {
+        const stored = recalled.value as { output?: unknown; text: string; sessionId?: string };
+        if (!step.replayed) step.cacheHit = true;
+        step.sessionId = stored.sessionId;
+        const handle: ClaudeHandle<unknown> = {
+          name: options.name,
+          output: stored.output,
+          text: stored.text,
+          sessionId: stored.sessionId,
+          cacheHit: step.cacheHit === true,
+          step,
+        };
+        return { value: handle, output: handle.output, text: handle.text };
+      }
+
       const handle = await this.runClaudeStep(options, jsonSchema, step, signal);
-      if (key) {
-        await this.runner.config.cache!.set(key, {
+      if (cacheable) {
+        await this.runner.config.cache!.set(fingerprint, {
           output: handle.output,
           text: handle.text,
           sessionId: handle.sessionId,
@@ -234,51 +251,88 @@ export class RunContext<I = unknown> {
     const name = step.name;
     const cwd = options.cwd ?? this.workspace;
     return this.runner.execute(step, async (record, signal) => {
-      const key = await this.cacheKey(name, 'command', options.cache, stepConfig(options), upstream);
-
-      if (key) {
-        record.cacheKey = key;
-        const hit = (await this.runner.config.cache!.get(key)) as CommandOutcome | undefined;
-        if (hit !== undefined) {
-          record.cacheHit = true;
-          record.exitCode = hit.exitCode;
-          return { value: commandHandle(name, hit, record, true), output: hit };
-        }
+      const cacheable = this.cacheable(options.cache);
+      const fingerprint = await this.fingerprint(name, 'command', options.cache, stepConfig(options), upstream);
+      record.fingerprint = fingerprint;
+      if (cacheable) {
+        record.cacheKey = fingerprint;
         record.cacheHit = false;
+      }
+
+      const recalled = await this.recall(record, fingerprint, cacheable, (prior) => prior.output);
+      if (recalled) {
+        const outcome = recalled.value as CommandOutcome;
+        if (!record.replayed) record.cacheHit = true;
+        record.exitCode = outcome.exitCode;
+        return { value: commandHandle(name, outcome, record, record.cacheHit === true), output: outcome };
       }
 
       const outcome = await runCommand(options, cwd, signal);
       record.exitCode = outcome.exitCode;
       assertCommandOk(options, outcome);
-      if (key) await this.runner.config.cache!.set(key, outcome);
+      if (cacheable) await this.runner.config.cache!.set(fingerprint, outcome);
       const handle = commandHandle(name, outcome, record, false);
       return { value: handle, output: outcome };
     }, { timeout: options.timeout });
   }
 
   /**
-   * A key for a cacheable step, or `undefined` when the step did not opt in or the
-   * run has no cache adapter. Steps are never cacheable by default.
+   * The identity of a step's work.
+   *
+   * Computed for every step, not only cacheable ones: a cacheable step uses it as its
+   * cache key, and a resumed run uses it to decide whether an earlier run's result for
+   * this step still stands. One value, because both questions are the same question.
    */
-  private async cacheKey(
+  private async fingerprint(
     stepName: string,
     kind: string,
     cache: CacheOptions | undefined,
     config: Record<string, unknown>,
     upstream: { name: string; output: unknown }[] = this.runner.upstreamOutputs(),
-  ): Promise<string | undefined> {
-    if (!cache || !this.runner.config.cache) return undefined;
+  ): Promise<string> {
     return computeCacheKey({
       pipeline: this.runner.config.pipeline,
       stepName,
       kind,
       config,
-      inputs: cache.inputs ?? [],
+      inputs: cache?.inputs ?? [],
       workspace: this.workspace,
       pipelineInput: this.input,
       upstream,
       model: this.runner.config.model ?? 'default',
     });
+  }
+
+  /**
+   * Whether a cacheable step may consult the cache: it opted in and the run was given
+   * an adapter. Steps are never cacheable by default.
+   */
+  private cacheable(cache: CacheOptions | undefined): boolean {
+    return Boolean(cache && this.runner.config.cache);
+  }
+
+  /**
+   * A result for this fingerprint that already exists — from the run being resumed, or
+   * from the cache when the step opted in.
+   *
+   * Resuming and caching ask the same question and differ only in where the answer
+   * comes from, so they are one lookup rather than two branches at every call site.
+   * The resumed run wins: it is the more specific answer, and it is free.
+   */
+  private async recall(
+    record: StepRecord,
+    fingerprint: string,
+    cacheable: boolean,
+    fromReplay: (prior: StepRecord) => unknown,
+  ): Promise<{ value: unknown } | undefined> {
+    const prior = this.runner.replay(fingerprint);
+    if (prior) {
+      record.replayed = true;
+      return { value: fromReplay(prior) };
+    }
+    if (!cacheable) return undefined;
+    const hit = await this.runner.config.cache!.get(fingerprint);
+    return hit === undefined ? undefined : { value: hit };
   }
 
   /**

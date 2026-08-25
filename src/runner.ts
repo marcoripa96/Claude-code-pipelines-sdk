@@ -26,6 +26,8 @@ export interface RunnerConfig {
   cache?: CacheAdapter;
   claude?: ClaudeRunner;
   signal?: AbortSignal;
+  /** A previous run whose completed steps this run may replay instead of redoing. */
+  resumeFrom?: RunResult;
 }
 
 /**
@@ -37,11 +39,18 @@ export class Runner {
   readonly record: RunRecord;
   readonly steps: StepRecord[] = [];
   private nextIndex = 0;
+  /** Completed steps of the run being resumed, by fingerprint. Empty when not resuming. */
+  private readonly replayable: Map<string, StepRecord>;
   /** The default runner, created once per run and only if a Claude step needs it. */
   claudeRunner?: ClaudeRunner;
 
   constructor(config: RunnerConfig) {
     this.config = config;
+    this.replayable = new Map(
+      (config.resumeFrom?.steps ?? [])
+        .filter((step) => step.status === 'completed' && step.fingerprint !== undefined)
+        .map((step) => [step.fingerprint!, step]),
+    );
     this.record = {
       id: config.runId,
       pipeline: config.pipeline,
@@ -58,6 +67,18 @@ export class Runner {
     return this.steps
       .filter((s) => s.status === 'completed')
       .map((s) => ({ name: s.name, output: s.output ?? s.text ?? null }));
+  }
+
+  /**
+   * The completed step from the run being resumed that did this exact work, if there
+   * is one.
+   *
+   * Matching on the fingerprint is what makes resume safe to chain: a step's
+   * fingerprint covers every upstream Output, so a step that genuinely re-runs and
+   * produces something different breaks the match for everything after it.
+   */
+  replay(fingerprint: string): StepRecord | undefined {
+    return this.replayable.get(fingerprint);
   }
 
   /** Fans one of Claude's messages out to storage and to the `message` event, verbatim. */

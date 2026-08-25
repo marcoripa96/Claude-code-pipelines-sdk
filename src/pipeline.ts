@@ -38,6 +38,15 @@ export interface RunOptions<I> {
   signal?: AbortSignal;
   /** Overrides the generated run id, so a caller can correlate it with its own record. */
   runId?: string;
+  /**
+   * A previous run to resume. Every step whose work is unchanged replays that run's
+   * result instead of doing it again, so a failure in step nine costs step nine rather
+   * than the eight sessions before it.
+   *
+   * Take it from the `RunResult` the earlier `run()` returned, or from one you rebuilt
+   * yourself: storage is write-only by ADR 0003, so the SDK never reads it back.
+   */
+  resumeFrom?: RunResult;
 }
 
 export interface Pipeline<I, O> {
@@ -80,6 +89,7 @@ export function definePipeline<S extends Schema | undefined = undefined, O = unk
         cache: options.cache,
         claude: options.claude,
         signal: options.signal,
+        resumeFrom: options.resumeFrom,
       });
 
       const ctx = new RunContext(runner, input as never);

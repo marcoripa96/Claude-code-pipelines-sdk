@@ -77,14 +77,45 @@ bun run examples/implement-issue.ts
 
 | | declares | returns |
 |---|---|---|
-| `ctx.claude(...)` | `prompt`, optional `output` schema, `retry`, `model`, `cwd`, `cache` | handle with `.output` (schema) or `.text` (no schema) |
-| `ctx.command(...)` | `command`, `allowFailure`, `cwd`, `env`, `cache` | handle with `.stdout`, `.stderr`, `.exitCode`; throws on a non-zero exit unless allowed |
-| `ctx.step(name, fn)` | a function | whatever the function returns |
+| `ctx.claude(...)` | `prompt`, optional `output` schema, `retry`, `model`, `cwd`, `cache`, `timeout` | handle with `.output` (schema) or `.text` (no schema) |
+| `ctx.command(...)` | `command`, `allowFailure`, `cwd`, `env`, `cache`, `timeout` | handle with `.stdout`, `.stderr`, `.exitCode`; throws on a non-zero exit unless allowed |
+| `ctx.commands([...])` | a group of command steps, optional `concurrency` | their handles, in the order declared |
+| `ctx.step(name, fn)` | a function, optional `{ timeout }` | whatever the function returns |
 | `ctx.halt(reason)` | a reason | `never` — the run ends, successfully |
 
-Steps execute sequentially (ADR 0004). Context crosses between steps as interpolated
-Output values or as data a step re-reads; a Claude session is always fresh and never
-inherits another step's conversation.
+Steps execute sequentially, except a group handed to `ctx.commands()` (ADR 0004).
+Context crosses between steps as interpolated Output values or as data a step re-reads;
+a Claude session is always fresh and never inherits another step's conversation.
+
+### Deadlines
+
+Any step may declare `timeout`, in milliseconds. It is enforced by the runner rather
+than by each kind, so it means the same thing everywhere: a command step's process is
+killed, a Claude session is aborted, and a code step that never looks at the signal it
+was handed still fails on time.
+
+```ts
+await ctx.command({ name: 'test', command: 'bun test', timeout: 5 * 60_000 });
+await ctx.step('poll', (signal) => fetch(url, { signal }), { timeout: 10_000 });
+```
+
+A deadline is not part of a cache key: how long a step was allowed to take does not
+change what it produced.
+
+### Running commands together
+
+```ts
+const [lint, test, types] = await ctx.commands([
+  { name: 'lint', command: 'bun run lint' },
+  { name: 'test', command: 'bun test' },
+  { name: 'typecheck', command: 'tsc --noEmit' },
+], { concurrency: 2 });   // omit to run them all at once
+```
+
+Command steps only — concurrent Claude steps would race on one workspace, which is why
+ADR 0004 made runs sequential in the first place. A group is recorded in the order it
+was written, every member is keyed against the same upstream snapshot, and if one fails
+its siblings still finish and are recorded before the group throws.
 
 ### Claude steps
 
@@ -109,6 +140,7 @@ await pipeline.run({
   cache: sqliteCache('.pipelines/cache.sqlite'),
   claude: fake({ ... }), // fixture Outputs instead of real sessions
   signal,                // an AbortSignal
+  resumeFrom: previous,  // a previous RunResult; unchanged steps replay instead of re-running
   on: {
     runStarted:  (run)  => {},
     stepStarted: (step) => {},
@@ -122,6 +154,29 @@ await pipeline.run({
 
 The workspace is per run, because the thing a pipeline works on may be a different
 checkout each time.
+
+### Resuming a failed run
+
+```ts
+const first = await pipeline.run({ input });
+if (first.status === 'failed') {
+  await pipeline.run({ input, resumeFrom: first });
+}
+```
+
+Every step whose work is unchanged replays the earlier run's result, so a failure in
+step nine costs step nine and not the eight sessions before it. Code steps replay too,
+which is the point: a resumed run must not post the comment twice.
+
+A step replays when its **fingerprint** matches a completed step of the earlier run —
+the same value ADR 0006 defines as a cache key, computed for every step. Because it
+covers the Outputs above a step, a step that genuinely produces something different
+invalidates everything below it, while one that re-runs and produces the same Output
+leaves them replayable.
+
+The SDK never reads your storage (ADR 0003): pass the `RunResult` you were given, or
+rebuild one with your own query — the sqlite adapter records the fingerprint each step
+needs.
 
 ### Storage
 
@@ -195,10 +250,11 @@ decisions and why:
 | [0001](docs/adr/0001-code-owns-control-flow.md) | Code owns control flow; Claude only supplies values |
 | [0002](docs/adr/0002-native-output-format.md) | Use the Agent SDK's native `outputFormat` for step Outputs |
 | [0003](docs/adr/0003-pluggable-storage.md) | Storage is a pluggable adapter, with `bun:sqlite` as the default |
-| [0004](docs/adr/0004-sequential-execution.md) | Runs are sequential, but steps still return handles |
+| [0004](docs/adr/0004-sequential-execution.md) | Runs are sequential by default, and command steps may fan out |
 | [0005](docs/adr/0005-bun-only.md) | The SDK targets bun, not Node |
 | [0006](docs/adr/0006-conservative-cache-keys.md) | Cache keys deliberately over-invalidate |
 | [0007](docs/adr/0007-declared-step-names-for-skipped.md) | Skipped steps come from an optional declared step list |
+| [0008](docs/adr/0008-resume-from-a-run-record.md) | Resume takes the previous run's record, not a read from storage |
 
 ## Licence
 

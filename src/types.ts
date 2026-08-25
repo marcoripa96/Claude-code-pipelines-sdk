@@ -57,6 +57,15 @@ export interface StepRecord {
   attempts?: number;
   cacheKey?: string;
   cacheHit?: boolean;
+  /**
+   * Identity of this step's work: what it declared, its declared input files, the
+   * pipeline input, the model, and every upstream Output. Computed for every step,
+   * cacheable or not, because it is also how a later run decides whether this step's
+   * result still stands. A cacheable step uses the same value as its `cacheKey`.
+   */
+  fingerprint?: string;
+  /** True when this step's result came from the run being resumed rather than from work. */
+  replayed?: boolean;
 }
 
 /** What a run wrote about itself. */

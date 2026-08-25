@@ -81,11 +81,16 @@ Sessions are always fresh: a Claude step never inherits another step's conversat
 
 | | declares | returns |
 |---|---|---|
-| `ctx.claude(...)` | `prompt`, optional `output` schema, `retry`, `model`, `cwd`, `cache` | handle with `.output` (schema) or `.text` (no schema) |
-| `ctx.command(...)` | `command`, `allowFailure`, `cache` | handle with `.stdout`, `.stderr`, `.exitCode`; throws on non-zero unless allowed |
-| `ctx.step(name, fn)` | a function | whatever the function returns |
+| `ctx.claude(...)` | `prompt`, optional `output` schema, `retry`, `model`, `cwd`, `cache`, `timeout` | handle with `.output` (schema) or `.text` (no schema) |
+| `ctx.command(...)` | `command`, `allowFailure`, `cache`, `timeout` | handle with `.stdout`, `.stderr`, `.exitCode`; throws on non-zero unless allowed |
+| `ctx.commands([...])` | a group of command steps, optional `concurrency` | their handles, in declaration order |
+| `ctx.step(name, fn)` | a function, optional `{ timeout }` | whatever the function returns |
 
-`Bun.$` runs command steps underneath. Steps execute sequentially.
+Command steps are spawned as `sh -c`, not run through `Bun.$`: a step's `timeout` has to
+be able to kill the process, and `$` exposes no way to cancel one.
+
+Steps execute sequentially, except a group handed to `ctx.commands()` (ADR 0004). Every
+step may declare a `timeout`, enforced by the runner so it bounds all three kinds alike.
 
 ## Claude sessions
 
@@ -135,6 +140,22 @@ events we define, and Claude's `SDKMessage` passed through verbatim.
 Opt-in only, per step, via `cache: { inputs: ['package.json'] }`. The key hashes step
 config, declared input file contents, pipeline input, upstream Outputs and the model
 name — see ADR 0006.
+
+## Resuming
+
+```ts
+const first = await implementIssue.run({ input: { issueId: 42 } });
+if (first.status === 'failed') {
+  await implementIssue.run({ input: { issueId: 42 }, resumeFrom: first });
+}
+```
+
+Every step whose work is unchanged replays the earlier run's result rather than doing it
+again — code steps included, so a resumed run does not repeat their External effects. The
+match is on a step's **fingerprint**, the same value caching uses as its key but computed
+for every step; because it covers the Outputs above a step, a changed Output invalidates
+everything below it. The SDK never reads storage to find the earlier run: you pass the
+record you were given, or rebuild one with your own query. See ADR 0008.
 
 ## Testing
 

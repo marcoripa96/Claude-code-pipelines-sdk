@@ -17,6 +17,16 @@ export interface SqliteStorage extends StorageAdapter {
   readonly db: Database;
 }
 
+/**
+ * Adds a column unless it is already there. Table and column names come from this
+ * file, never from a caller, so interpolating them is not a data path.
+ */
+function addColumn(db: Database, table: string, column: string, type: string): void {
+  const columns = db.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (columns.some((existing) => existing.name === column)) return;
+  db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
@@ -49,7 +59,11 @@ CREATE TABLE IF NOT EXISTS steps (
   session_id TEXT,
   attempts INTEGER,
   cache_key TEXT,
-  cache_hit INTEGER
+  cache_hit INTEGER,
+  -- Persisted so a consumer can rebuild a RunResult and pass it back as resumeFrom:
+  -- without the fingerprint there is nothing to match a replayable step on.
+  fingerprint TEXT,
+  replayed INTEGER
 );
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,6 +90,11 @@ export function sqliteStorage(options: SqliteStorageOptions | string = {}): Sqli
   const config = typeof options === 'string' ? { path: options } : options;
   const db = config.database ?? openDatabase(config.path ?? '.pipelines/runs.sqlite');
   db.run(SCHEMA);
+  // CREATE TABLE IF NOT EXISTS leaves an existing table exactly as it found it, so a
+  // column added after a database was first created has to be added explicitly. An
+  // adapter is routinely pointed at the consumer's own long-lived database.
+  addColumn(db, 'steps', 'fingerprint', 'TEXT');
+  addColumn(db, 'steps', 'replayed', 'INTEGER');
 
   // A plain insert: a run id that is already recorded is a mistake worth hearing about,
   // not two runs to be merged into one row with interleaved steps.
@@ -95,7 +114,8 @@ export function sqliteStorage(options: SqliteStorageOptions | string = {}): Sqli
   const updateStep = db.query(`
     UPDATE steps SET status = $status, finished_at = $finished_at, duration_ms = $duration_ms,
       output = $output, text = $text, error = $error, exit_code = $exit_code,
-      session_id = $session_id, attempts = $attempts, cache_key = $cache_key, cache_hit = $cache_hit
+      session_id = $session_id, attempts = $attempts, cache_key = $cache_key, cache_hit = $cache_hit,
+      fingerprint = $fingerprint, replayed = $replayed
     WHERE id = $id
   `);
   const insertMessage = db.query(`
@@ -161,6 +181,8 @@ export function sqliteStorage(options: SqliteStorageOptions | string = {}): Sqli
         $attempts: step.attempts ?? null,
         $cache_key: step.cacheKey ?? null,
         $cache_hit: step.cacheHit === undefined ? null : step.cacheHit ? 1 : 0,
+        $fingerprint: step.fingerprint ?? null,
+        $replayed: step.replayed === undefined ? null : step.replayed ? 1 : 0,
       });
     },
     messageAppended(stepId: string, message: SDKMessage) {
