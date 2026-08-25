@@ -1,0 +1,4 @@
+node_modules
+.pipeline
+dist
+*.log
