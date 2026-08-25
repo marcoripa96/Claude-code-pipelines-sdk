@@ -52,7 +52,7 @@ describe('core runner', () => {
       name: 'halting',
       steps: ['first', 'second', 'third'],
       async run(ctx) {
-        await ctx.step('first', () => reached.push('first'));
+        await ctx.step('first', () => void reached.push('first'));
         ctx.halt('nothing to do');
         await ctx.step('second', () => reached.push('second'));
         await ctx.step('third', () => reached.push('third'));
@@ -136,10 +136,10 @@ describe('core runner', () => {
     await pipeline.run({
       input: undefined,
       on: {
-        runStarted: (r: RunRecord) => events.push(`run:${r.status}`),
-        stepStarted: (s: StepRecord) => events.push(`step+:${s.name}`),
-        stepFinished: (s: StepRecord) => events.push(`step-:${s.name}:${s.status}`),
-        runFinished: (r: RunRecord) => events.push(`done:${r.status}`),
+        runStarted: (r: RunRecord) => void events.push(`run:${r.status}`),
+        stepStarted: (s: StepRecord) => void events.push(`step+:${s.name}`),
+        stepFinished: (s: StepRecord) => void events.push(`step-:${s.name}:${s.status}`),
+        runFinished: (r: RunRecord) => void events.push(`done:${r.status}`),
       },
     });
 
@@ -166,7 +166,7 @@ describe('core runner', () => {
         stepStarted: () => {
           throw new Error('listener blew up');
         },
-        error: (e) => seen.push(e),
+        error: (e) => void seen.push(e),
       },
     });
 

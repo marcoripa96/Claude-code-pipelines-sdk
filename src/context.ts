@@ -1,4 +1,6 @@
 import type { Runner } from './runner.ts';
+import type { CommandHandle, CommandStepOptions } from './types.ts';
+import { assertCommandOk, commandHandle, runCommand } from './command.ts';
 import { HaltSignal } from './errors.ts';
 
 /**
@@ -26,6 +28,22 @@ export class RunContext<I = unknown> {
     return this.runner.execute(name, 'code', async () => {
       const value = await fn();
       return { value, output: value };
+    });
+  }
+
+  /**
+   * Runs a shell command as a step. Throws on a non-zero exit unless the step
+   * declared `allowFailure`, in which case the handle carries the exit code.
+   */
+  command(options: CommandStepOptions): Promise<CommandHandle> {
+    const name = options.name ?? options.command;
+    const cwd = options.cwd ?? this.workspace;
+    return this.runner.execute(name, 'command', async (step) => {
+      const outcome = await runCommand(options, cwd);
+      step.exitCode = outcome.exitCode;
+      assertCommandOk(options, outcome);
+      const handle = commandHandle(name, outcome, step, false);
+      return { value: handle, output: outcome };
     });
   }
 
