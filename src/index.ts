@@ -4,6 +4,8 @@ export { RunContext } from './context.ts';
 export { createClaudeRunner } from './claude.ts';
 export { sqliteStorage } from './storage/sqlite.ts';
 export { computeCacheKey, memoryCache, sqliteCache } from './cache.ts';
+export { fake, session } from './fake.ts';
+export type { FakeRunner, Fixture, StepFixture } from './fake.ts';
 export type { CacheKeyParts } from './cache.ts';
 export type { SqliteStorage, SqliteStorageOptions } from './storage/sqlite.ts';
 export {
