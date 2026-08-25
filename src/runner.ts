@@ -72,18 +72,13 @@ export class Runner {
   }
 
   /**
-   * Runs one step, recording it whatever happens. `work` receives the live record so
-   * a step kind can annotate it (exit code, session id, cache hit) before it finishes,
-   * and the signal it must do its work under — the run's, narrowed by this step's
-   * `timeout` when it declared one.
+   * Claims a step's place in the run, before any of its work starts.
+   *
+   * Separate from `execute` so a concurrent group can claim all of its places up
+   * front and be recorded in the order it was declared, rather than in whatever order
+   * its members happened to finish.
    */
-  async execute<T>(
-    name: string,
-    kind: StepKind,
-    work: (step: StepRecord, signal: AbortSignal) => Promise<{ value: T; output?: unknown; text?: string }>,
-    options: { timeout?: number } = {},
-  ): Promise<T> {
-    this.throwIfAborted();
+  beginStep(name: string, kind: StepKind): StepRecord {
     const step: StepRecord = {
       id: crypto.randomUUID(),
       runId: this.record.id,
@@ -94,6 +89,25 @@ export class Runner {
       startedAt: Date.now(),
     };
     this.steps.push(step);
+    return step;
+  }
+
+  /**
+   * Runs one step, recording it whatever happens. `work` receives the live record so
+   * a step kind can annotate it (exit code, session id, cache hit) before it finishes,
+   * and the signal it must do its work under — the run's, narrowed by this step's
+   * `timeout` when it declared one.
+   */
+  async execute<T>(
+    step: StepRecord,
+    work: (step: StepRecord, signal: AbortSignal) => Promise<{ value: T; output?: unknown; text?: string }>,
+    options: { timeout?: number } = {},
+  ): Promise<T> {
+    this.throwIfAborted();
+    const name = step.name;
+    // Set again here: a step held behind a concurrency limit was claimed earlier than
+    // it actually began, and its duration should not count the wait.
+    step.startedAt = Date.now();
     await this.storage((s) => s.stepStarted(step));
     await this.emit((e) => e.stepStarted?.(step));
 

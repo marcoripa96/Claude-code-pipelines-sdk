@@ -15,6 +15,7 @@ import { assertCommandOk, commandHandle, runCommand } from './command.ts';
 import { ClaudeStepError, HaltSignal, isHalt } from './errors.ts';
 import { createClaudeRunner } from './claude.ts';
 import { computeCacheKey } from './cache.ts';
+import { Limiter } from './limiter.ts';
 
 /**
  * What a pipeline's `run` function is handed. Every method here records a step;
@@ -48,8 +49,7 @@ export class RunContext<I = unknown> {
     options: { timeout?: number } = {},
   ): Promise<T> {
     return this.runner.execute(
-      name,
-      'code',
+      this.runner.beginStep(name, 'code'),
       async (_step, signal) => {
         const value = await fn(signal);
         return { value, output: value };
@@ -70,7 +70,7 @@ export class RunContext<I = unknown> {
     options: ClaudeStepOptions<S> & { output: S },
   ): Promise<ClaudeHandle<Infer<S>>>;
   claude(options: ClaudeStepOptions<Schema | undefined>): Promise<ClaudeHandle<unknown>> {
-    return this.runner.execute(options.name, 'claude', async (step, signal) => {
+    return this.runner.execute(this.runner.beginStep(options.name, 'claude'), async (step, signal) => {
       const jsonSchema = options.output
         ? await toJsonSchema(options.name, options.output)
         : undefined;
@@ -187,27 +187,71 @@ export class RunContext<I = unknown> {
    * declared `allowFailure`, in which case the handle carries the exit code.
    */
   command(options: CommandStepOptions): Promise<CommandHandle> {
-    const name = options.name ?? options.command;
+    const step = this.runner.beginStep(commandStepName(options), 'command');
+    return this.commandStep(options, step);
+  }
+
+  /**
+   * Runs several command steps at once, resolving to their handles in the order they
+   * were declared. `concurrency` bounds how many run together; by default they all do.
+   *
+   * Command steps only. ADR 0004 rules out concurrent Claude steps because they share
+   * one workspace and would race on the same files — that hazard is real and this does
+   * not touch it. A fan-out of read-only checks (lint, test, typecheck) has no such
+   * problem, and was the case that motivated the SDK in the first place.
+   *
+   * Every member is keyed against the same upstream Outputs, snapshotted before the
+   * group starts. Without that a member's cache key would depend on which sibling
+   * happened to finish first, and the same group would key differently run to run.
+   */
+  async commands(
+    list: readonly CommandStepOptions[],
+    options: { concurrency?: number } = {},
+  ): Promise<CommandHandle[]> {
+    const upstream = this.runner.upstreamOutputs();
+    // Places are claimed for all of them first, so the run records the group in the
+    // order it was written rather than the order it finished.
+    const steps = list.map((item) => this.runner.beginStep(commandStepName(item), 'command'));
+    const limiter = new Limiter(options.concurrency ?? Infinity);
+
+    const settled = await Promise.allSettled(
+      list.map((item, i) => limiter.run(() => this.commandStep(item, steps[i]!, upstream))),
+    );
+
+    // Siblings are allowed to finish before the group throws: a failed group should
+    // still record every step it started, not leave half of them unfinished.
+    const failure = settled.find((result) => result.status === 'rejected');
+    if (failure) throw (failure as PromiseRejectedResult).reason;
+    return settled.map((result) => (result as PromiseFulfilledResult<CommandHandle>).value);
+  }
+
+  /** @internal The body of one command step, however it was scheduled. */
+  private commandStep(
+    options: CommandStepOptions,
+    step: StepRecord,
+    upstream?: { name: string; output: unknown }[],
+  ): Promise<CommandHandle> {
+    const name = step.name;
     const cwd = options.cwd ?? this.workspace;
-    return this.runner.execute(name, 'command', async (step, signal) => {
-      const key = await this.cacheKey(name, 'command', options.cache, stepConfig(options));
+    return this.runner.execute(step, async (record, signal) => {
+      const key = await this.cacheKey(name, 'command', options.cache, stepConfig(options), upstream);
 
       if (key) {
-        step.cacheKey = key;
+        record.cacheKey = key;
         const hit = (await this.runner.config.cache!.get(key)) as CommandOutcome | undefined;
         if (hit !== undefined) {
-          step.cacheHit = true;
-          step.exitCode = hit.exitCode;
-          return { value: commandHandle(name, hit, step, true), output: hit };
+          record.cacheHit = true;
+          record.exitCode = hit.exitCode;
+          return { value: commandHandle(name, hit, record, true), output: hit };
         }
-        step.cacheHit = false;
+        record.cacheHit = false;
       }
 
       const outcome = await runCommand(options, cwd, signal);
-      step.exitCode = outcome.exitCode;
+      record.exitCode = outcome.exitCode;
       assertCommandOk(options, outcome);
       if (key) await this.runner.config.cache!.set(key, outcome);
-      const handle = commandHandle(name, outcome, step, false);
+      const handle = commandHandle(name, outcome, record, false);
       return { value: handle, output: outcome };
     }, { timeout: options.timeout });
   }
@@ -221,6 +265,7 @@ export class RunContext<I = unknown> {
     kind: string,
     cache: CacheOptions | undefined,
     config: Record<string, unknown>,
+    upstream: { name: string; output: unknown }[] = this.runner.upstreamOutputs(),
   ): Promise<string | undefined> {
     if (!cache || !this.runner.config.cache) return undefined;
     return computeCacheKey({
@@ -231,7 +276,7 @@ export class RunContext<I = unknown> {
       inputs: cache.inputs ?? [],
       workspace: this.workspace,
       pipelineInput: this.input,
-      upstream: this.runner.upstreamOutputs(),
+      upstream,
       model: this.runner.config.model ?? 'default',
     });
   }
@@ -243,6 +288,11 @@ export class RunContext<I = unknown> {
   halt(reason: string): never {
     throw new HaltSignal(reason);
   }
+}
+
+/** A command step's recorded name: what it declared, else the command itself. */
+function commandStepName(options: CommandStepOptions): string {
+  return options.name ?? options.command;
 }
 
 /**
