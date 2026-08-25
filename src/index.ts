@@ -27,6 +27,7 @@ export type {
   CommandHandle,
   CommandStepOptions,
   Infer,
+  InferInput,
   RunEvents,
   RunRecord,
   RunResult,

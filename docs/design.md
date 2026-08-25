@@ -1,6 +1,7 @@
 # Design
 
-The shape agreed during the design interview. Nothing here is implemented yet.
+The shape agreed during the design interview, as implemented. Where the implementation
+learned something the interview could not, this file says so.
 
 ## The rule
 

@@ -46,6 +46,17 @@ describe('core runner', () => {
     );
   });
 
+  test('a schema default is optional to pass and filled in on ctx.input', async () => {
+    const pipeline = definePipeline({
+      name: 'defaults',
+      input: z.object({ issueId: z.number(), testCommand: z.string().default('bun test') }),
+      run: (ctx) => ctx.input.testCommand,
+    });
+
+    expect((await pipeline.run({ input: { issueId: 1 } })).output).toBe('bun test');
+    expect((await pipeline.run({ input: { issueId: 1, testCommand: 'true' } })).output).toBe('true');
+  });
+
   test('halt ends the run successfully and marks later declared steps skipped', async () => {
     const reached: string[] = [];
     const pipeline = definePipeline({

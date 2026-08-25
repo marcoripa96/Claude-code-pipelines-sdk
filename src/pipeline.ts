@@ -1,5 +1,6 @@
 import type {
   ClaudeRunner,
+  InferInput,
   CacheAdapter,
   RunEvents,
   RunResult,
@@ -51,8 +52,8 @@ export interface Pipeline<I, O> {
  */
 export function definePipeline<S extends Schema | undefined = undefined, O = unknown>(
   definition: PipelineDefinition<S, O>,
-): Pipeline<S extends Schema<infer T> ? T : void, O> {
-  type I = S extends Schema<infer T> ? T : void;
+): Pipeline<S extends Schema ? InferInput<S> : void, O> {
+  type I = S extends Schema ? InferInput<S> : void;
 
   return {
     name: definition.name,

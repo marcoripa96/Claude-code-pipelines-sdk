@@ -5,11 +5,23 @@ import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
  * do not depend on a particular Zod build; `zod` v4 is a peer dependency and its
  * schemas satisfy this shape.
  */
-export interface Schema<T = unknown> {
-  parse(data: unknown): T;
+export interface Schema<Output = unknown> {
+  parse(data: unknown): Output;
 }
 
+/** What a schema produces — `ctx.input`, and a Claude step's Output. */
 export type Infer<S> = S extends Schema<infer T> ? T : never;
+
+/**
+ * What a schema accepts. Read off the Standard Schema properties Zod exposes, so a
+ * field with a `.default()` stays optional in the value you pass to `run()` while
+ * `ctx.input` still sees it filled in.
+ */
+export type InferInput<S> = S extends {
+  readonly '~standard': { readonly types?: { readonly input: infer I } | undefined };
+}
+  ? I
+  : Infer<S>;
 
 /** How a step did its work. */
 export type StepKind = 'claude' | 'command' | 'code';
