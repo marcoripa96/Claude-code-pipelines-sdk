@@ -114,6 +114,7 @@ export function createKanbyFactory({
       'publish-checks',
       'review',
       'publish-review',
+      'confirm-reviewed',
       'open-merge-request',
       'link-development',
       'move-in-review',
@@ -459,6 +460,24 @@ export function createKanbyFactory({
         // Review depth scales with risk. The board has one review column, so the
         // only depth this pipeline can express is "a human decides before this is
         // published at all" — and the scores the reviewer produced are what decides.
+        // The reviewer is a session like any other: same model, same tools, same
+        // credentials, same workspace. Nothing stops it committing and pushing, and a
+        // merge request opens against the *branch* — so anything that moved the branch
+        // after the score, the reviewer included, would be published unreviewed.
+        //
+        // The answer is not to take tools away, which a session with Bash can route
+        // around anyway. It is to check: what is about to be published must still be
+        // what was scored.
+        const published = await ctx.step('confirm-reviewed', (signal) =>
+          repository.verifyCommit(ctx.workspace, ctx.input.gitlab, signal),
+        );
+        if (published.sha !== reviewed.sha) {
+          await handOffToHuman(
+            `Branch moved to ${published.sha} after ${reviewed.sha} was reviewed: what ` +
+            `would be published is not what was scored`,
+          );
+        }
+
         const peak = peakRisk(review.output);
         if (rank(peak.level) > rank(ctx.input.maxUnattendedRisk)) {
           await handOffToHuman(

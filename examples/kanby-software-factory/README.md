@@ -95,6 +95,8 @@ both:
     -> complete: leave the loop
     -> concerns and revisions remain: revise -> implement again
     -> concerns and revisions exhausted: handoff, halt in in_progress
+  confirm the branch is still at the reviewed commit
+    -> it moved: handoff, halt in in_progress
   peak risk above the unattended ceiling: handoff, halt in in_progress
   open the merge request on GitLab (find or create)
   record the merge request on the task as its development link
@@ -274,6 +276,13 @@ commit, and `origin/<branch>` at exactly that commit. A review is therefore boun
 immutable sha that anyone can fetch, rather than to whatever the working tree happened to
 hold. Checks run through `SANDBOX_RUNNER` with no network and no host credentials, and
 Git runs with hooks disabled.
+
+The reviewer is a session like any other — same model, same tools, same credentials —
+so nothing stops it committing and pushing after it has scored, and a merge request opens
+against the *branch*. `confirm-reviewed` observes the branch a second time immediately
+before publishing, and stops the run if it is no longer at the commit that was scored.
+That is the shape of every guarantee here: not a capability taken away, which a session
+with `Bash` can route around, but a fact checked at the point where it matters.
 
 The merge request and every board write stay in pipeline code. A pushed branch affects
 nobody on its own; the merge request is the publication, and the risk gate has to be able

@@ -48,6 +48,7 @@ describe('the kanby-software-factory example', () => {
       'checks:true',
       'output:Checks',
       'output:Review',
+      'verify-commit',
       'ensure-mr:group/project:task/42-digest-dates->main',
       'link-mr:17',
       'move:in_review',
@@ -98,6 +99,7 @@ describe('the kanby-software-factory example', () => {
       'checks:true',
       'output:Checks',
       'output:Review',
+      'verify-commit',
       'ensure-mr:group/project:task/42-digest-dates->main',
       'link-mr:17',
       'move:in_review',
@@ -196,6 +198,7 @@ describe('the kanby-software-factory example', () => {
       'checks:true',
       'output:Checks',
       'output:Review',
+      'verify-commit',
       'ensure-mr:group/project:task/42-digest-dates->main',
       'link-mr:17',
       'move:in_review',
@@ -334,6 +337,36 @@ describe('the kanby-software-factory example', () => {
 
     expect(result.status).toBe('completed');
     expect(fixture.effects).toContain('ensure-mr:group/project:task/42-digest-dates->main');
+  });
+
+  test('refuses to publish a branch that moved after it was reviewed', async () => {
+    const fixture = harness();
+
+    // The reviewer is a session with the same tools and credentials as the implementer,
+    // so nothing stops it committing and pushing after it has scored. The second
+    // observation is what catches that: the branch is no longer at the reviewed commit.
+    let observations = 0;
+    fixture.dependencies.repository.verifyCommit = async () => {
+      observations += 1;
+      fixture.effects.push('verify-commit');
+      return observations === 1
+        ? { sha: 'abc123', base: 'base000', commits: 1 }
+        : { sha: 'def456', base: 'base000', commits: 2 };
+    };
+
+    const result = await createKanbyFactory(fixture.dependencies).run({
+      input: input('true'),
+      claude: fake({
+        implement: { summary: 'implemented' },
+        review: review({}),
+      }),
+    });
+
+    expect(result.status).toBe('halted');
+    expect(result.haltReason).toContain('Branch moved to def456 after abc123 was reviewed');
+    // Nothing was published, and the card is back in a human's hands.
+    expect(fixture.effects).not.toContain('ensure-mr:group/project:task/42-digest-dates->main');
+    expect(fixture.effects.slice(-2)).toEqual([`block:${result.haltReason}`, 'release']);
   });
 
   test('blocks and releases the card when a step throws', async () => {
