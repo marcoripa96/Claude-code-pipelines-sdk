@@ -6,6 +6,7 @@ import {
 import { z } from 'zod';
 import {
   RISK_LEVELS,
+  type CommitUnderReview,
   type KanbyFactoryDependencies,
   type RiskLevel,
 } from './contracts.ts';
@@ -36,8 +37,14 @@ const input = z.object({
    * scaling with risk.
    */
   maxUnattendedRisk: risk.default('medium'),
-  /** A change larger than this is handed to a human rather than reviewed by a model. */
-  maxDiffBytes: z.number().int().min(1).default(100_000),
+  /**
+   * A change larger than this is handed to a human rather than scored by a model.
+   *
+   * Optional, and off when omitted: a ceiling is a statement about how much diff *your*
+   * reviewing model reads usefully, and there is no honest default for that. Set it when
+   * you have one.
+   */
+  maxDiffBytes: z.number().int().min(1).optional(),
   gitlab: z.object({
     host: z.string().url(),
     project: z.string().min(1),
@@ -51,9 +58,6 @@ const PREPARATION_KEYS = [
   'kanby-software-factory/classification',
   'kanby-software-factory/analysis',
 ];
-
-/** Read-only sessions: they answer, the pipeline writes. */
-const READ_ONLY_TOOLS = ['Bash', 'Read', 'Grep', 'Glob'];
 
 /**
  * One pipeline for every open task: it reads where the task is on the board and
@@ -113,12 +117,11 @@ export function createKanbyFactory({
       'move-in-progress',
       'implement',
       'publish-implementation',
+      'verify-commit',
       'check',
       'publish-checks',
-      'stage-change',
       'review',
       'publish-review',
-      'commit',
       'push',
       'open-merge-request',
       'link-development',
@@ -232,9 +235,6 @@ export function createKanbyFactory({
               rationale: z.string(),
               requiresHumanTriage: z.boolean(),
             }),
-            // Reading the board is all this session may do. Enforced here rather
-            // than asked for in the prompt.
-            allowedTools: ['Bash'],
           });
           type = classification.output.type;
 
@@ -285,7 +285,6 @@ export function createKanbyFactory({
               risk: z.enum(['low', 'medium', 'high']),
               requiredChecks: z.array(z.string()),
             }),
-            allowedTools: READ_ONLY_TOOLS,
             // The only session whose Output gates a column move, and the only one
             // whose work a human cannot cheaply redo from the card.
             retry: 2,
@@ -328,6 +327,9 @@ export function createKanbyFactory({
           kanby.move(task.guid, 'in_progress', ctx.workspace, signal),
         );
 
+        // The last round's verdict and the commit it was passed. Both leave the loop,
+        // because what the gate below decides about, and what `push` publishes, is
+        // whatever the final round settled on.
         let review!: ClaudeHandle<{
           summary: string;
           completeness: 'complete' | 'partial' | 'missing';
@@ -336,6 +338,7 @@ export function createKanbyFactory({
           performanceRisk: RiskLevel;
           compatibilityRisk: RiskLevel;
         }>;
+        let reviewed!: CommitUnderReview;
         for (let round = 1; ; round++) {
           // Every step in the loop carries the round, so a two-round run reads as
           // fourteen distinct records rather than seven names appearing twice.
@@ -347,21 +350,23 @@ export function createKanbyFactory({
                 `1. Read the task: kanby show ${task.guid} — its content is the prepared brief.\n` +
                 `2. Implement the brief in this workspace, as written. If the brief turns out ` +
                 `to be wrong, follow it as far as it holds and say so in your summary.\n` +
-                `3. Do not commit, push or touch the board: the pipeline publishes and ` +
-                `records those effects itself.\n\n` +
+                `3. Commit your work on branch ${ctx.input.gitlab.sourceBranch}, referencing ` +
+                `${taskLabel} in the message, and leave the workspace clean. Only what you ` +
+                `commit is reviewed, and only what passes review is published.\n` +
+                `4. Do not push, do not open a merge request, and do not write to the board. ` +
+                `A risk gate reads your commit first, and the pipeline publishes what clears ` +
+                `it.\n\n` +
                 `Summarise what you did through the structured output.`
               : `You are revising kanby task ${taskLabel} after review round ${round - 1} ` +
                 `flagged concerns.\n\n` +
                 `1. Read the task: kanby show ${task.guid} — its content is the prepared ` +
                 `brief, and its Review output holds the concerns to address.\n` +
                 `2. Revise the implementation in this workspace.\n` +
-                `3. Do not commit, push or touch the board: the pipeline publishes and ` +
-                `records those effects itself.\n\n` +
+                `3. Commit the revision on branch ${ctx.input.gitlab.sourceBranch} and leave ` +
+                `the workspace clean.\n` +
+                `4. Do not push, do not open a merge request, and do not write to the board.\n\n` +
                 `Summarise the revision through the structured output.`,
             output: z.object({ summary: z.string() }),
-            // Publishing is the pipeline's job in every case; denying it here means
-            // a session cannot half-publish by accident.
-            disallowedTools: ['Bash(git commit:*)', 'Bash(git push:*)'],
           });
 
           await ctx.step(`publish-implementation${suffix}`, (signal) =>
@@ -376,6 +381,20 @@ export function createKanbyFactory({
               signal,
             ),
           );
+
+          // What the session actually left, read back rather than taken on trust. From
+          // here the change is one immutable object: `change.sha` is what the reviewer
+          // scores and what `push` publishes, so the two cannot drift apart.
+          reviewed = await ctx.step(`verify-commit${suffix}`, (signal) =>
+            repository.verifyCommit(ctx.workspace, ctx.input.gitlab, signal),
+          );
+          const ceiling = ctx.input.maxDiffBytes;
+          if (ceiling !== undefined && reviewed.diffBytes > ceiling) {
+            await handOffToHuman(
+              `Change is ${reviewed.diffBytes} bytes, larger than ${ceiling}, and was ` +
+              `not reviewed`,
+            );
+          }
 
           const checked = await ctx.step(`check${suffix}`, (signal) =>
             checks.run(ctx.workspace, ctx.input.testCommand, signal),
@@ -407,27 +426,13 @@ export function createKanbyFactory({
             );
           }
 
-          const staged = await ctx.step(`stage-change${suffix}`, (signal) =>
-            repository.stage(
-              ctx.workspace,
-              ctx.input.gitlab.sourceBranch,
-              ctx.input.maxDiffBytes,
-              signal,
-            ),
-          );
-          if (staged.truncated) {
-            await handOffToHuman(
-              `Change is larger than ${ctx.input.maxDiffBytes} bytes and was not reviewed`,
-            );
-          }
-
           review = await ctx.claude({
             name: `review${suffix}`,
             prompt:
               `You are reviewing kanby task ${taskLabel} before a human reviewer does.\n\n` +
               `1. Read the task: kanby show ${task.guid} — its content is the prepared ` +
               `brief, and its Checks output holds the recorded check run.\n` +
-              `2. Get the change: git diff --cached\n` +
+              `2. Get the change: git diff ${reviewed.base} ${reviewed.sha}\n` +
               `3. Judge completeness against the brief and the change's side-effect, ` +
               `performance and compatibility risk. Your risk scores decide how much ` +
               `human attention this change gets, so score the change, not your ` +
@@ -441,10 +446,6 @@ export function createKanbyFactory({
               performanceRisk: risk,
               compatibilityRisk: risk,
             }),
-            // A reviewer that edits the tree would invalidate the diff it was given
-            // and make `commit` refuse. Read-only makes that unreachable rather
-            // than merely discouraged.
-            allowedTools: READ_ONLY_TOOLS,
           });
 
           await ctx.step(`publish-review${suffix}`, (signal) =>
@@ -481,11 +482,10 @@ export function createKanbyFactory({
           );
         }
 
-        const commit = await ctx.step('commit', (signal) =>
-          repository.commit(ctx.workspace, task, ctx.input.gitlab.sourceBranch, signal),
-        );
+        // The first effect anyone outside this workspace can see, and the first one the
+        // gate above has let through.
         await ctx.step('push', (signal) =>
-          repository.push(ctx.workspace, ctx.input.gitlab, commit.sha, signal),
+          repository.push(ctx.workspace, ctx.input.gitlab, reviewed.sha, signal),
         );
 
         // One system of record per step: GitLab owns the merge request, Kanby

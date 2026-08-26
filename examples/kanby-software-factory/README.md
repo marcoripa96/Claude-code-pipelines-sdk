@@ -44,7 +44,8 @@ definition rather than standing beside it:
   retried without repeating half of it. `open-merge-request` and `link-development` are
   separate because replay demands it, not because it reads better.
 - **Homogeneous failure semantics inside a step**, because the retry envelope *is* the
-  step: `commit` (local, reversible) and `push` (remote, irreversible) cannot share one.
+  step: reading back what was committed (local, an observation) and `push` (remote,
+  irreversible) cannot share one.
 - **Gates are one system each too**: `preflight-git` and `preflight-gitlab` are separate
   so a failure names the system that is not provisioned.
 - **Formatting, branching and halt checks are code *between* steps** — they have no
@@ -86,18 +87,17 @@ both:
   preflight-git: clean tree, branch and remote agree with the destination
   preflight-gitlab: project and target branch are reachable
   move -> in_progress
-  implement prepared brief -> attach Implementation output
+  implement prepared brief, committing the work -> attach Implementation output
+  verify the commit: right branch, clean tree, something actually committed
+    -> oversized change (only if MAX_DIFF_BYTES is set): handoff, halt in in_progress
   run checks in an isolated sandbox -> attach Checks output
     -> failure: handoff, halt in in_progress
-  stage the whole change (new files included)
-    -> oversized change: handoff, halt in in_progress
-  review (read-only tools), reading the task and the staged diff itself
+  review the commit range, reading the task and `git diff <base> <sha>`
     -> complete: leave the loop
     -> concerns and revisions remain: revise -> implement again
     -> concerns and revisions exhausted: handoff, halt in in_progress
   peak risk above the unattended ceiling: handoff, halt in in_progress
-  commit
-  push
+  push the reviewed sha
   open the merge request on GitLab (find or create)
   record the merge request on the task as its development link
   move in_progress -> in_review
@@ -138,8 +138,8 @@ the human who opens it knows whether they are giving it a glance or an hour.
 ### Step names and revision rounds
 
 Every step in the implementation loop carries its round: round two records
-`implement-2`, `publish-implementation-2`, `check-2`, `publish-checks-2`,
-`stage-change-2`, `review-2`, `publish-review-2`. A two-round run therefore reads as
+`implement-2`, `publish-implementation-2`, `verify-commit-2`, `check-2`,
+`publish-checks-2`, `review-2`, `publish-review-2`. A two-round run therefore reads as
 fourteen distinct records rather than seven names appearing twice. Those dynamic names
 stay outside the declared `steps` list by design; the declared list is only used to record
 what a halt stopped the run from reaching (ADR 0007).
@@ -238,7 +238,7 @@ export SANDBOX_RUNNER=sandbox-exec
 export MAX_REVISIONS=1                # revision rounds before handing over
 export MIN_CONFIDENCE=0.8             # below this, classification is a human's question
 export MAX_UNATTENDED_RISK=medium     # peak review risk that may reach a merge request
-export MAX_DIFF_BYTES=100000          # larger changes go to a human unreviewed
+export MAX_DIFF_BYTES=100000          # optional; unset means review a change of any size
 export RUN_DB=.pipelines/runs.sqlite  # the run's own step-by-step history
 
 bun run examples/kanby-software-factory/index.ts --real
@@ -255,20 +255,30 @@ before implementation starts.
 
 Prompts are short job statements, not documents: each names the task and points at the
 sources — `kanby show` for board truth (the brief and recorded checks live there),
-`git diff --cached` for the change — and the model chooses its own path from there. What
-is asked for in a prompt is also enforced around it: `classify`, `analyze` and `review`
-declare `allowedTools`, so a reviewer *cannot* edit the tree it was asked only to read,
-and `implement` denies `git commit` and `git push` outright. Checks run through
+`git diff <base> <sha>` for the change — and the model chooses its own path from there.
+Sessions get the full tool set; the prompt is the guideline, and what actually holds is
+verified afterwards rather than forbidden in advance. Tool allow-lists were tried and
+removed: a list containing `Bash` restricts nothing, so it bought a false sense of a
+guarantee that the checks below already provide for real.
+
+What holds without the model's cooperation: the implementing session commits, and
+`verify-commit` reads back what it left — right branch, clean tree, at least one commit —
+so a review is bound to an immutable sha rather than to whatever the working tree happens
+to hold. `push` refuses any sha that is not the reviewed one. Checks run through
 `SANDBOX_RUNNER` with no network and no host credentials, Git runs with hooks disabled,
-and commit refuses to run if the workspace changed after the change was staged. A change
-too large to review blocks the task instead of being silently cut.
+and Git preflight re-verifies the remote before pushing. If `MAX_DIFF_BYTES` is set, a
+change above it blocks the task instead of being silently cut.
+
+Push, the merge request and every board write stay in pipeline code, because the risk
+gate has to be able to withhold them — and because a session holding push credentials
+could reach every repository that key reaches, not just this branch.
 
 A run that stops is picked up, not restarted. What every step does about a crash that
 left it in flight is declared once, as the pipeline's `defaults: { onCrash: 'rerun' }`,
 because it is a property of the pipeline rather than of twenty separate steps: the board
 writes, Git and GitLab are all repeatable — `move`, `block`, `release` and `development
-upsert` are set-operations, `commit` recognises its own `Kanby-Task:` marker on HEAD,
-`push` pushes a sha that is already there, and `ensure` finds the merge request before
+upsert` are set-operations, `verify-commit` only reads, `push` pushes a sha that is
+already there, and `ensure` finds the merge request before
 creating one. The single exception is `claim`, which `kanby` guards on the snapshot it was
 read from and which would therefore *fail* rather than duplicate; it asks the board
 whether the claim is already ours and adopts it if so, which settles the question without

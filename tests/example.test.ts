@@ -44,11 +44,10 @@ describe('the kanby-software-factory example', () => {
       'preflight-gitlab',
       'move:in_progress',
       'output:Implementation',
+      'verify-commit',
       'checks:true',
       'output:Checks',
-      'stage-change:100000',
       'output:Review',
-      'commit',
       'push:task/42-digest-dates:abc123',
       'ensure-mr:group/project:task/42-digest-dates->main',
       'link-mr:17',
@@ -96,11 +95,10 @@ describe('the kanby-software-factory example', () => {
       'preflight-gitlab',
       'move:in_progress',
       'output:Implementation',
+      'verify-commit',
       'checks:true',
       'output:Checks',
-      'stage-change:100000',
       'output:Review',
-      'commit',
       'push:task/42-digest-dates:abc123',
       'ensure-mr:group/project:task/42-digest-dates->main',
       'link-mr:17',
@@ -161,7 +159,7 @@ describe('the kanby-software-factory example', () => {
     ).toEqual(['handoff-block:completed', 'handoff-release:completed']);
     expect(fixture.effects).toContain('block:Check command exited 1: false');
     expect(fixture.effects.at(-1)).toBe('release');
-    expect(fixture.effects).not.toContain('commit');
+    expect(fixture.effects).not.toContain('push:task/42-digest-dates:abc123');
   });
 
   test('revises once and publishes when the second review approves', async () => {
@@ -191,16 +189,15 @@ describe('the kanby-software-factory example', () => {
       'preflight-gitlab',
       'move:in_progress',
       'output:Implementation',
+      'verify-commit',
       'checks:true',
       'output:Checks',
-      'stage-change:100000',
       'output:Review',
       'output:Implementation',
+      'verify-commit',
       'checks:true',
       'output:Checks',
-      'stage-change:100000',
       'output:Review',
-      'commit',
       'push:task/42-digest-dates:abc123',
       'ensure-mr:group/project:task/42-digest-dates->main',
       'link-mr:17',
@@ -232,7 +229,7 @@ describe('the kanby-software-factory example', () => {
     ]);
     expect(fixture.effects).toContain('block:Implementation is partial');
     expect(fixture.effects.at(-1)).toBe('release');
-    expect(fixture.effects).not.toContain('commit');
+    expect(fixture.effects).not.toContain('push:task/42-digest-dates:abc123');
   });
 
   test('blocks immediately when revisions are disabled', async () => {
@@ -251,7 +248,7 @@ describe('the kanby-software-factory example', () => {
     expect(claude.calls.map((call) => call.stepName)).toEqual(['implement', 'review']);
     expect(fixture.effects).toContain('block:no test covers the DST boundary');
     expect(fixture.effects.at(-1)).toBe('release');
-    expect(fixture.effects).not.toContain('commit');
+    expect(fixture.effects).not.toContain('push:task/42-digest-dates:abc123');
   });
 
   test('leaves low-confidence classification blocked in backlog', async () => {
@@ -294,9 +291,9 @@ describe('the kanby-software-factory example', () => {
     ).toEqual([
       'implement-2',
       'publish-implementation-2',
+      'verify-commit-2',
       'check-2',
       'publish-checks-2',
-      'stage-change-2',
       'review-2',
       'publish-review-2',
     ]);
@@ -325,7 +322,7 @@ describe('the kanby-software-factory example', () => {
       '**Suggested review depth:** deep review',
     );
     expect(fixture.effects.at(-1)).toBe('release');
-    expect(fixture.effects).not.toContain('commit');
+    expect(fixture.effects).not.toContain('push:task/42-digest-dates:abc123');
   });
 
   test('publishes the same change when the ceiling is raised to high', async () => {
@@ -339,7 +336,42 @@ describe('the kanby-software-factory example', () => {
     });
 
     expect(result.status).toBe('completed');
-    expect(fixture.effects).toContain('commit');
+    expect(fixture.effects).toContain('push:task/42-digest-dates:abc123');
+  });
+
+  test('reviews a change of any size when no ceiling is set, and gates one when it is', async () => {
+    const big = () => {
+      const fixture = harness();
+      fixture.dependencies.repository.verifyCommit = async () => ({
+        sha: 'abc123',
+        base: 'base000',
+        commits: 1,
+        diffBytes: 900_000,
+      });
+      return fixture;
+    };
+
+    const uncapped = big();
+    const reviewed = await createKanbyFactory(uncapped.dependencies).run({
+      input: input('true'),
+      claude: fake({ implement: { summary: 'big change' }, review: review({}) }),
+    });
+
+    // No ceiling means no gate: a large change is reviewed like any other.
+    expect(reviewed.status).toBe('completed');
+    expect(uncapped.effects).toContain('push:task/42-digest-dates:abc123');
+
+    const capped = big();
+    const stopped = await createKanbyFactory(capped.dependencies).run({
+      input: input('true', 1, { maxDiffBytes: 1_000 }),
+      claude: fake({ implement: { summary: 'big change' }, review: review({}) }),
+    });
+
+    expect(stopped.status).toBe('halted');
+    expect(stopped.haltReason).toContain('900000 bytes, larger than 1000');
+    expect(capped.effects).not.toContain('push:task/42-digest-dates:abc123');
+    // Stopping still releases the card, like every other way this pipeline stops.
+    expect(capped.effects.at(-1)).toBe('release');
   });
 
   test('blocks and releases the card when a step throws', async () => {
@@ -385,7 +417,10 @@ describe('the kanby-software-factory example', () => {
 function input(
   testCommand: string,
   maxRevisions = 1,
-  overrides: { maxUnattendedRisk?: 'none' | 'low' | 'medium' | 'high' } = {},
+  overrides: {
+    maxUnattendedRisk?: 'none' | 'low' | 'medium' | 'high';
+    maxDiffBytes?: number;
+  } = {},
 ) {
   return {
     taskGuid: '019f-task',
@@ -610,13 +645,9 @@ function harness(taskOverrides: Partial<KanbyTask> = {}) {
     async preflight() {
       effects.push('preflight-git');
     },
-    async stage(_workspace: string, _branch: string, maxDiffBytes: number) {
-      effects.push(`stage-change:${maxDiffBytes}`);
-      return { truncated: false };
-    },
-    async commit() {
-      effects.push('commit');
-      return { sha: 'abc123' };
+    async verifyCommit() {
+      effects.push('verify-commit');
+      return { sha: 'abc123', base: 'base000', commits: 1, diffBytes: 512 };
     },
     async push(_workspace: string, destination: { sourceBranch: string }, sha: string) {
       effects.push(`push:${destination.sourceBranch}:${sha}`);

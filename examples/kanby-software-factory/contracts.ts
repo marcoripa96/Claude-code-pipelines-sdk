@@ -87,24 +87,41 @@ export interface KanbyClient {
   ): Promise<void>;
 }
 
+/**
+ * The commit a review is bound to.
+ *
+ * The implementing session commits its own work — `.git` is inside the workspace, and
+ * committing is a workspace action like any other. What the pipeline does is *observe*
+ * what the session left, and name it: from here on the change is one immutable object
+ * rather than whatever the working tree happens to hold, so the diff the reviewer scored
+ * is provably the diff that gets pushed.
+ */
+export interface CommitUnderReview {
+  /** What the session left at HEAD. */
+  sha: string;
+  /** The merge base with the target branch: what the change is measured against. */
+  base: string;
+  /** How many commits the session left. Zero means it committed nothing. */
+  commits: number;
+  /** Size of `base..sha` as a diff, in bytes. The pipeline decides what is too large. */
+  diffBytes: number;
+}
+
 export interface RepositoryClient {
   preflight(
     workspace: string,
     destination: GitLabDestination,
     signal: AbortSignal,
   ): Promise<void>;
-  stage(
+  /**
+   * Reads back what the implementing session committed, and refuses anything a review
+   * could not be bound to: the wrong branch, a dirty tree, or no commit at all.
+   */
+  verifyCommit(
     workspace: string,
-    sourceBranch: string,
-    maxDiffBytes: number,
+    destination: GitLabDestination,
     signal: AbortSignal,
-  ): Promise<{ truncated: boolean }>;
-  commit(
-    workspace: string,
-    task: KanbyTask,
-    sourceBranch: string,
-    signal: AbortSignal,
-  ): Promise<{ sha: string }>;
+  ): Promise<CommitUnderReview>;
   push(
     workspace: string,
     destination: GitLabDestination,

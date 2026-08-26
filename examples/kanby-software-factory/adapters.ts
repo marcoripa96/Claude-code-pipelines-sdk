@@ -3,7 +3,6 @@ import type {
   ChecksClient,
   GitLabDestination,
   KanbyClient,
-  KanbyTask,
   MergeRequestRef,
   MergeRequestsClient,
   RepositoryClient,
@@ -219,44 +218,30 @@ export function gitRepository(options: { sshAuthSock?: string } = {}): Repositor
       await assertGitDestination(workspace, destination, signal);
     },
 
-    async stage(workspace, sourceBranch, maxDiffBytes, signal) {
-      await assertBranch(workspace, sourceBranch, signal);
-      await git(workspace, ['add', '--all'], signal);
-      const diff = await git(workspace, ['diff', '--cached', '--no-ext-diff', '--'], signal);
-      return { truncated: diff.stdout.length > maxDiffBytes };
-    },
+    async verifyCommit(workspace, destination, signal) {
+      await assertBranch(workspace, destination.sourceBranch, signal);
 
-    async commit(workspace, task, sourceBranch, signal) {
-      await assertBranch(workspace, sourceBranch, signal);
-      const unstaged = await runProcess(
-        ['git', '-c', 'core.hooksPath=/dev/null', 'diff', '--quiet'],
-        workspace,
-        signal,
-      );
-      if (unstaged.exitCode > 1) throw processError(['git', 'diff', '--quiet'], unstaged);
-      const untracked = await git(workspace, ['ls-files', '--others', '--exclude-standard'], signal);
-      if (unstaged.exitCode === 1 || untracked.stdout.trim()) {
-        throw new Error('workspace changed after review evidence was collected');
-      }
-      const diff = await runProcess(['git', 'diff', '--cached', '--quiet'], workspace, signal);
-      if (diff.exitCode > 1) throw processError(['git', 'diff', '--cached', '--quiet'], diff);
-
-      const marker = `Kanby-Task: ${task.guid}`;
-      if (diff.exitCode === 0) {
-        const previous = await git(workspace, ['log', '-1', '--format=%B'], signal);
-        if (!previous.stdout.includes(marker)) {
-          throw new Error('implementation produced no changes to commit');
-        }
-      } else {
-        const taskLabel = task.displayNumber === null ? task.guid : `#${task.displayNumber}`;
-        await git(
-          workspace,
-          ['commit', '-m', `${taskLabel} ${task.title}`, '-m', marker],
-          signal,
+      // Anything uncommitted is anything the review will not see. Rather than quietly
+      // reviewing a subset, the run stops and says the session left work behind.
+      const status = await git(workspace, ['status', '--porcelain'], signal);
+      if (status.stdout.trim()) {
+        throw new Error(
+          'workspace is not clean: the implementation left work uncommitted, and only ' +
+          'what is committed is reviewed',
         );
       }
 
-      return { sha: (await git(workspace, ['rev-parse', 'HEAD'], signal)).stdout.trim() };
+      const sha = (await git(workspace, ['rev-parse', 'HEAD'], signal)).stdout.trim();
+      const base = await mergeBase(workspace, destination.targetBranch, sha, signal);
+      const commits = Number(
+        (await git(workspace, ['rev-list', '--count', `${base}..${sha}`], signal)).stdout.trim(),
+      );
+      if (commits === 0) throw new Error('implementation produced no commit to review');
+
+      // Measured against the merge base rather than the previous round, so a revision is
+      // sized as the whole change a human would open, not as the delta from round one.
+      const diff = await git(workspace, ['diff', '--no-ext-diff', base, sha], signal);
+      return { sha, base, commits, diffBytes: diff.stdout.length };
     },
 
     async push(workspace, destination, sha, signal) {
@@ -403,6 +388,32 @@ async function assertGitDestination(
       }
     }
   }
+}
+
+/**
+ * The commit the change is measured from: the merge base of the target branch and what
+ * the session left. `origin/<target>` is preferred, because a local target branch may be
+ * months stale while the remote one is what the merge request will actually target.
+ */
+async function mergeBase(
+  workspace: string,
+  targetBranch: string,
+  sha: string,
+  signal: AbortSignal,
+): Promise<string> {
+  for (const ref of [`origin/${targetBranch}`, targetBranch]) {
+    const found = await runProcess(
+      ['git', '-c', 'core.hooksPath=/dev/null', 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`],
+      workspace,
+      signal,
+    );
+    if (found.exitCode !== 0) continue;
+    return (await git(workspace, ['merge-base', ref, sha], signal)).stdout.trim();
+  }
+  throw new Error(
+    `target branch ${targetBranch} is not available locally (tried origin/${targetBranch} ` +
+    `and ${targetBranch}); fetch it before the run`,
+  );
 }
 
 async function assertBranch(
