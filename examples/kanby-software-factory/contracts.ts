@@ -97,14 +97,12 @@ export interface KanbyClient {
  * is provably the diff that gets pushed.
  */
 export interface CommitUnderReview {
-  /** What the session left at HEAD. */
+  /** What the session left at HEAD, and what the remote branch now points at. */
   sha: string;
   /** The merge base with the target branch: what the change is measured against. */
   base: string;
   /** How many commits the session left. Zero means it committed nothing. */
   commits: number;
-  /** Size of `base..sha` as a diff, in bytes. The pipeline decides what is too large. */
-  diffBytes: number;
 }
 
 export interface RepositoryClient {
@@ -114,20 +112,19 @@ export interface RepositoryClient {
     signal: AbortSignal,
   ): Promise<void>;
   /**
-   * Reads back what the implementing session committed, and refuses anything a review
-   * could not be bound to: the wrong branch, a dirty tree, or no commit at all.
+   * Reads back what the implementing session committed and pushed, and refuses anything
+   * a review could not be bound to: the wrong branch, a dirty tree, no commit at all, or
+   * a remote branch that is not at the commit under review.
+   *
+   * The session does the committing and the pushing; this only observes. A branch on the
+   * remote affects nobody on its own — the merge request is the publication, and that is
+   * what the risk gate withholds.
    */
   verifyCommit(
     workspace: string,
     destination: GitLabDestination,
     signal: AbortSignal,
   ): Promise<CommitUnderReview>;
-  push(
-    workspace: string,
-    destination: GitLabDestination,
-    sha: string,
-    signal: AbortSignal,
-  ): Promise<void>;
 }
 
 export interface ChecksClient {

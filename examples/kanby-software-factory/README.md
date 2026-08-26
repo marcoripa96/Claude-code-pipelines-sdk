@@ -44,8 +44,8 @@ definition rather than standing beside it:
   retried without repeating half of it. `open-merge-request` and `link-development` are
   separate because replay demands it, not because it reads better.
 - **Homogeneous failure semantics inside a step**, because the retry envelope *is* the
-  step: reading back what was committed (local, an observation) and `push` (remote,
-  irreversible) cannot share one.
+  step: reading back what was pushed (an observation) and opening the merge request
+  (irreversible, and what a human is asked to attend to) cannot share one.
 - **Gates are one system each too**: `preflight-git` and `preflight-gitlab` are separate
   so a failure names the system that is not provisioned.
 - **Formatting, branching and halt checks are code *between* steps** — they have no
@@ -88,8 +88,7 @@ both:
   preflight-gitlab: project and target branch are reachable
   move -> in_progress
   implement prepared brief, committing the work -> attach Implementation output
-  verify the commit: right branch, clean tree, something actually committed
-    -> oversized change (only if MAX_DIFF_BYTES is set): handoff, halt in in_progress
+  verify what was pushed: right branch, clean tree, a real commit, origin at it
   run checks in an isolated sandbox -> attach Checks output
     -> failure: handoff, halt in in_progress
   review the commit range, reading the task and `git diff <base> <sha>`
@@ -97,7 +96,6 @@ both:
     -> concerns and revisions remain: revise -> implement again
     -> concerns and revisions exhausted: handoff, halt in in_progress
   peak risk above the unattended ceiling: handoff, halt in in_progress
-  push the reviewed sha
   open the merge request on GitLab (find or create)
   record the merge request on the task as its development link
   move in_progress -> in_review
@@ -238,20 +236,29 @@ export SANDBOX_RUNNER=sandbox-exec
 export MAX_REVISIONS=1                # revision rounds before handing over
 export MIN_CONFIDENCE=0.8             # below this, classification is a human's question
 export MAX_UNATTENDED_RISK=medium     # peak review risk that may reach a merge request
-export MAX_DIFF_BYTES=100000          # optional; unset means review a change of any size
 export RUN_DB=.pipelines/runs.sqlite  # the run's own step-by-step history
 
 bun run examples/kanby-software-factory/index.ts --real
 ```
 
-The entry point captures each credential where it is needed, then removes it from the
-process environment before opening a Claude session: the write `KANBY_API_KEY` goes to
-Kanby subprocesses only, `GITLAB_TOKEN` to GitBeaker only, and `SSH_AUTH_SOCK` to
-`git push` only. What remains ambient for sessions is the read-only board token, and
-nothing else. Git preflight verifies that every fetch/push URL for `origin`, the current
-branch and the configured self-hosted GitLab project agree before implementation starts,
-and verifies them again before push. GitBeaker verifies project and target-branch access
-before implementation starts.
+The entry point captures each credential where it is needed, then removes from the
+process environment the ones a session must not see: the write `KANBY_API_KEY` goes to
+Kanby subprocesses only and `GITLAB_TOKEN` to GitBeaker only. What remains ambient for a
+session is the read-only board token — and `SSH_AUTH_SOCK`, because the implementing
+session pushes its own branch.
+
+Bound that credential on the server, not in the prompt. The session pushes to task
+branches; protecting `main` (and whatever else you merge into) is what stops it reaching
+anything that matters, and it holds regardless of what the model decides to do. Within
+those limits a pushed branch is cheap: it affects nobody until the merge request opens,
+and the risk gate is what decides whether that happens.
+
+The one thing branch protection does not bound is *other* repositories the key can reach.
+A deploy key scoped to this project closes that; a personal agent socket does not.
+`SESSION_DENIED` in `adapters.ts` is the seam to narrow it at. Git preflight also verifies
+that every fetch/push URL for `origin`, the current branch and the configured GitLab
+project agree before implementation starts, and GitBeaker verifies project and
+target-branch access, so a misdirected push is caught early.
 
 Prompts are short job statements, not documents: each names the task and points at the
 sources — `kanby show` for board truth (the brief and recorded checks live there),
@@ -261,25 +268,23 @@ verified afterwards rather than forbidden in advance. Tool allow-lists were trie
 removed: a list containing `Bash` restricts nothing, so it bought a false sense of a
 guarantee that the checks below already provide for real.
 
-What holds without the model's cooperation: the implementing session commits, and
-`verify-commit` reads back what it left — right branch, clean tree, at least one commit —
-so a review is bound to an immutable sha rather than to whatever the working tree happens
-to hold. `push` refuses any sha that is not the reviewed one. Checks run through
-`SANDBOX_RUNNER` with no network and no host credentials, Git runs with hooks disabled,
-and Git preflight re-verifies the remote before pushing. If `MAX_DIFF_BYTES` is set, a
-change above it blocks the task instead of being silently cut.
+What holds without the model's cooperation: the implementing session commits and pushes,
+and `verify-commit` reads back what it left — right branch, clean tree, at least one
+commit, and `origin/<branch>` at exactly that commit. A review is therefore bound to an
+immutable sha that anyone can fetch, rather than to whatever the working tree happened to
+hold. Checks run through `SANDBOX_RUNNER` with no network and no host credentials, and
+Git runs with hooks disabled.
 
-Push, the merge request and every board write stay in pipeline code, because the risk
-gate has to be able to withhold them — and because a session holding push credentials
-could reach every repository that key reaches, not just this branch.
+The merge request and every board write stay in pipeline code. A pushed branch affects
+nobody on its own; the merge request is the publication, and the risk gate has to be able
+to withhold it.
 
 A run that stops is picked up, not restarted. What every step does about a crash that
 left it in flight is declared once, as the pipeline's `defaults: { onCrash: 'rerun' }`,
 because it is a property of the pipeline rather than of twenty separate steps: the board
 writes, Git and GitLab are all repeatable — `move`, `block`, `release` and `development
-upsert` are set-operations, `verify-commit` only reads, `push` pushes a sha that is
-already there, and `ensure` finds the merge request before
-creating one. The single exception is `claim`, which `kanby` guards on the snapshot it was
+upsert` are set-operations, `verify-commit` only reads, and `ensure` finds the merge
+request before creating one. The single exception is `claim`, which `kanby` guards on the snapshot it was
 read from and which would therefore *fail* rather than duplicate; it asks the board
 whether the claim is already ours and adopts it if so, which settles the question without
 consulting the default at all.

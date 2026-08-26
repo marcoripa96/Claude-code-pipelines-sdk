@@ -11,13 +11,8 @@ import type {
 } from './contracts.ts';
 
 /**
- * The variables that carry write authority.
- *
- * One list, because it is one rule: a child process gets a credential only by being
- * handed it. `runProcess` strips them from every spawn, and the entry point strips them
- * from this process so that Claude sessions — which inherit it — cannot see them either.
- * Both enforce the same rule from the same declaration rather than from two lists that
- * can drift apart.
+ * The variables that carry write authority. `runProcess` strips every one of them from
+ * every spawn, so a child gets a credential only by being handed it explicitly.
  */
 export const PRIVILEGED_ENV = [
   'GITLAB_TOKEN',
@@ -25,6 +20,18 @@ export const PRIVILEGED_ENV = [
   'KANBY_AGENT',
   'SSH_AUTH_SOCK',
 ] as const;
+
+/**
+ * Of those, the ones a Claude session must not see. Sessions inherit this process's
+ * environment, so the entry point deletes these from it outright.
+ *
+ * `SSH_AUTH_SOCK` is deliberately **not** here: the implementing session pushes its own
+ * task branch, so it needs a Git credential. What bounds that is the server — a protected
+ * `main` stops the session reaching anything that matters, whatever it decides to do.
+ * What the server does not bound is other repositories the same key can reach, so scope
+ * the credential to this project if that matters. This list is the seam to narrow it at.
+ */
+export const SESSION_DENIED = ['GITLAB_TOKEN', 'KANBY_API_KEY', 'KANBY_AGENT'] as const;
 
 interface ProcessResult {
   stdout: string;
@@ -238,24 +245,24 @@ export function gitRepository(options: { sshAuthSock?: string } = {}): Repositor
       );
       if (commits === 0) throw new Error('implementation produced no commit to review');
 
-      // Measured against the merge base rather than the previous round, so a revision is
-      // sized as the whole change a human would open, not as the delta from round one.
-      const diff = await git(workspace, ['diff', '--no-ext-diff', base, sha], signal);
-      return { sha, base, commits, diffBytes: diff.stdout.length };
-    },
-
-    async push(workspace, destination, sha, signal) {
-      await assertGitDestination(workspace, destination, signal);
-      const status = await git(workspace, ['status', '--porcelain'], signal);
-      if (status.stdout.trim()) throw new Error('workspace must be clean before push');
-      const head = (await git(workspace, ['rev-parse', 'HEAD'], signal)).stdout.trim();
-      if (head !== sha) throw new Error(`HEAD ${head} does not match commit step ${sha}`);
-      await git(
+      // The session pushes its own work; this checks it actually arrived, and that the
+      // remote branch is at exactly the commit about to be reviewed. A review bound to a
+      // sha nobody else can fetch would be a review of nothing.
+      const remote = await git(
         workspace,
-        ['push', '--set-upstream', 'origin', `${sha}:refs/heads/${destination.sourceBranch}`],
+        ['ls-remote', 'origin', `refs/heads/${destination.sourceBranch}`],
         signal,
         options.sshAuthSock ? { SSH_AUTH_SOCK: options.sshAuthSock } : undefined,
       );
+      const tip = remote.stdout.trim().split(/\s+/)[0];
+      if (tip !== sha) {
+        throw new Error(
+          `origin/${destination.sourceBranch} is at ${tip || 'nothing'}, not the commit ` +
+          `under review ${sha}: the implementation did not push what it committed`,
+        );
+      }
+
+      return { sha, base, commits };
     },
   };
 }

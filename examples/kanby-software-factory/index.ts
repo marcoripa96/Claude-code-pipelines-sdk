@@ -1,6 +1,7 @@
 import { gitWorkspaceSnapshots, sqliteStorage } from '@marcoripa96/claude-code-pipelines-sdk';
 import {
   PRIVILEGED_ENV,
+  SESSION_DENIED,
   gitLabMergeRequests,
   gitRepository,
   kanbyCli,
@@ -84,7 +85,6 @@ async function main(): Promise<void> {
       maxRevisions: number('MAX_REVISIONS'),
       minConfidence: number('MIN_CONFIDENCE'),
       maxUnattendedRisk: choice('MAX_UNATTENDED_RISK', RISK_LEVELS),
-      maxDiffBytes: number('MAX_DIFF_BYTES'),
       gitlab: {
         host,
         project: required('GITLAB_PROJECT'),
@@ -145,19 +145,23 @@ function choice<T extends string>(name: string, allowed: readonly T[]): T | unde
 }
 
 /**
- * Reads every privileged variable out of this process and removes it.
+ * Captures every privileged variable for the adapters, and deletes from this process the
+ * ones a Claude session must not see.
  *
- * Claude sessions inherit this process's environment, so the scrub has to happen to the
- * process itself and not only per spawn — `runProcess` filters the same list again, from
- * the same declaration, so an adapter used outside this entry point is no less safe.
+ * Sessions inherit this process's environment, so that deletion has to happen here and
+ * not only per spawn — `runProcess` filters the fuller list again, from the same
+ * declaration, so an adapter used outside this entry point is no less safe.
+ *
+ * `SSH_AUTH_SOCK` survives on purpose: the implementing session pushes. See
+ * `SESSION_DENIED` for what that costs and where to narrow it.
  */
 function takeCredentials(): Partial<Record<(typeof PRIVILEGED_ENV)[number], string>> {
   const taken: Partial<Record<(typeof PRIVILEGED_ENV)[number], string>> = {};
   for (const name of PRIVILEGED_ENV) {
     const value = process.env[name];
     if (value) taken[name] = value;
-    delete process.env[name];
   }
+  for (const name of SESSION_DENIED) delete process.env[name];
   return taken;
 }
 
