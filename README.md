@@ -66,11 +66,14 @@ const result = await triage.run({
 and steps the run never reached are recorded as `skipped`. A failure carries
 `result.error` (and the original error on `result.cause`).
 
-`examples/implement-issue.ts` is the full worked pipeline —
-classify → analyze → implement → review — runnable with fixture Outputs:
+[`examples/kanby-software-factory/`](examples/kanby-software-factory/) is a worked design
+against an ideal Kanby v2 CLI: one pipeline detects where a task is on the board and runs
+exactly the stages it still needs — classify and analyze `backlog` intake into an
+implementation-ready brief, or deliver a prepared `todo` through checks, review and a
+self-hosted GitLab merge request opened with GitBeaker.
 
 ```sh
-bun run examples/implement-issue.ts
+bun run examples/kanby-software-factory/index.ts --real
 ```
 
 ## Step kinds

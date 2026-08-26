@@ -54,12 +54,10 @@ export const implementIssue = definePipeline({
     const impl = await ctx.claude({
       name: 'implement',
       prompt: `Implement this plan:\n${analysis.output.plan}`,
-      output: z.object({ summary: z.string(), filesChanged: z.array(z.string()) }),
+      output: z.object({ summary: z.string() }),
     });
 
     await ctx.command({ name: 'test', command: 'bun test' });
-
-    return impl.output;
   },
 });
 
