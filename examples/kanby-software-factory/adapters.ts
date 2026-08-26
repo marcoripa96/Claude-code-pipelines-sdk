@@ -199,11 +199,11 @@ export function gitRepository(options: { sshAuthSock?: string } = {}): Repositor
       await assertGitDestination(workspace, destination, signal);
     },
 
-    async stage(workspace, sourceBranch, signal) {
+    async stage(workspace, sourceBranch, maxDiffBytes, signal) {
       await assertBranch(workspace, sourceBranch, signal);
       await git(workspace, ['add', '--all'], signal);
       const diff = await git(workspace, ['diff', '--cached', '--no-ext-diff', '--'], signal);
-      return { truncated: diff.stdout.length > 100_000 };
+      return { truncated: diff.stdout.length > maxDiffBytes };
     },
 
     async commit(workspace, task, sourceBranch, signal) {

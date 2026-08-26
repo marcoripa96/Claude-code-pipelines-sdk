@@ -4,6 +4,7 @@ import {
   createKanbyFactory,
   type KanbyTask,
   type KanbyFactoryDependencies,
+  type RiskLevel,
 } from '../examples/kanby-software-factory/pipeline.ts';
 
 /**
@@ -39,13 +40,13 @@ describe('the kanby-software-factory example', () => {
       'output:Analysis',
       'update:content',
       'move:todo',
-      'preflight',
+      'preflight-git',
       'preflight-gitlab',
       'move:in_progress',
       'output:Implementation',
       'checks:true',
       'output:Checks',
-      'stage-change',
+      'stage-change:100000',
       'output:Review',
       'commit',
       'push:task/42-digest-dates:abc123',
@@ -91,13 +92,13 @@ describe('the kanby-software-factory example', () => {
     expect(fixture.effects).toEqual([
       'get',
       'claim',
-      'preflight',
+      'preflight-git',
       'preflight-gitlab',
       'move:in_progress',
       'output:Implementation',
       'checks:true',
       'output:Checks',
-      'stage-change',
+      'stage-change:100000',
       'output:Review',
       'commit',
       'push:task/42-digest-dates:abc123',
@@ -117,7 +118,9 @@ describe('the kanby-software-factory example', () => {
 
     expect(result.status).toBe('halted');
     expect(result.haltReason).toBe('todo task is missing preparation outputs');
-    expect(fixture.effects).toEqual(['get', 'claim', 'release']);
+    // Decidable from the fetched snapshot alone, so it never claims and never has
+    // to undo a claim.
+    expect(fixture.effects).toEqual(['get']);
   });
 
   test('halts before claiming a task that is already blocked or out of intake', async () => {
@@ -165,7 +168,7 @@ describe('the kanby-software-factory example', () => {
     const fixture = harness();
     const claude = fake({
       implement: { summary: 'fixed the formatter' },
-      'implement-revise-2': { summary: 'addressed the review concerns' },
+      'implement-2': { summary: 'addressed the review concerns' },
       review: review({ concerns: ['no test covers the DST boundary'] }),
       'review-2': review(),
     });
@@ -178,24 +181,24 @@ describe('the kanby-software-factory example', () => {
     expect(claude.calls.map((call) => call.stepName)).toEqual([
       'implement',
       'review',
-      'implement-revise-2',
+      'implement-2',
       'review-2',
     ]);
     expect(fixture.effects).toEqual([
       'get',
       'claim',
-      'preflight',
+      'preflight-git',
       'preflight-gitlab',
       'move:in_progress',
       'output:Implementation',
       'checks:true',
       'output:Checks',
-      'stage-change',
+      'stage-change:100000',
       'output:Review',
       'output:Implementation',
       'checks:true',
       'output:Checks',
-      'stage-change',
+      'stage-change:100000',
       'output:Review',
       'commit',
       'push:task/42-digest-dates:abc123',
@@ -210,7 +213,7 @@ describe('the kanby-software-factory example', () => {
     const fixture = harness();
     const claude = fake({
       implement: { summary: 'fixed the formatter' },
-      'implement-revise-2': { summary: 'tried to address the concerns' },
+      'implement-2': { summary: 'tried to address the concerns' },
       review: review({ concerns: ['no test covers the DST boundary'] }),
       'review-2': review({ completeness: 'partial' }),
     });
@@ -224,7 +227,7 @@ describe('the kanby-software-factory example', () => {
     expect(claude.calls.map((call) => call.stepName)).toEqual([
       'implement',
       'review',
-      'implement-revise-2',
+      'implement-2',
       'review-2',
     ]);
     expect(fixture.effects).toContain('block:Implementation is partial');
@@ -267,15 +270,128 @@ describe('the kanby-software-factory example', () => {
     );
     expect(fixture.effects.at(-1)).toBe('release');
     expect(fixture.effects).not.toContain('move:todo');
-    expect(fixture.effects).not.toContain('preflight');
+    expect(fixture.effects).not.toContain('preflight-git');
+  });
+
+  test('records the revision round in every step of the loop', async () => {
+    const fixture = harness();
+    const claude = fake({
+      implement: { summary: 'fixed the formatter' },
+      'implement-2': { summary: 'addressed the review concerns' },
+      review: review({ concerns: ['no test covers the DST boundary'] }),
+      'review-2': review(),
+    });
+    const result = await createKanbyFactory(fixture.dependencies).run({
+      input: input('true'),
+      claude,
+    });
+
+    expect(result.status).toBe('completed');
+    // Seven steps per round, each named for its round: a two-round run reads as
+    // fourteen records rather than seven names appearing twice.
+    expect(
+      result.steps.filter((step) => step.name.endsWith('-2')).map((step) => step.name),
+    ).toEqual([
+      'implement-2',
+      'publish-implementation-2',
+      'check-2',
+      'publish-checks-2',
+      'stage-change-2',
+      'review-2',
+      'publish-review-2',
+    ]);
+    expect(fixture.outputs.filter((output) => output.title === 'Review').at(-1)?.body).toContain(
+      '**Revision round 2**',
+    );
+  });
+
+  test('hands a change over when its risk is above the unattended ceiling', async () => {
+    const fixture = harness();
+    const result = await createKanbyFactory(fixture.dependencies).run({
+      input: input('true'),
+      claude: fake({
+        implement: { summary: 'fixed the formatter' },
+        review: review({ compatibilityRisk: 'high' }),
+      }),
+    });
+
+    // The review is complete and raises no concerns; risk alone stopped it.
+    expect(result.status).toBe('halted');
+    expect(result.haltReason).toBe(
+      'Compatibility risk is high, above the unattended ceiling medium: ' +
+      'a human decides before this is published',
+    );
+    expect(fixture.outputs.find((output) => output.title === 'Review')?.body).toContain(
+      '**Suggested review depth:** deep review',
+    );
+    expect(fixture.effects.at(-1)).toBe('release');
+    expect(fixture.effects).not.toContain('commit');
+  });
+
+  test('publishes the same change when the ceiling is raised to high', async () => {
+    const fixture = harness();
+    const result = await createKanbyFactory(fixture.dependencies).run({
+      input: input('true', 1, { maxUnattendedRisk: 'high' }),
+      claude: fake({
+        implement: { summary: 'fixed the formatter' },
+        review: review({ compatibilityRisk: 'high' }),
+      }),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(fixture.effects).toContain('commit');
+  });
+
+  test('blocks and releases the card when a step throws', async () => {
+    const fixture = harness();
+    fixture.dependencies.repository.preflight = async () => {
+      throw new Error('workspace must be clean before the task run starts');
+    };
+
+    const result = await createKanbyFactory(fixture.dependencies).run({
+      input: input('true'),
+      claude: fake({}),
+    });
+
+    // A failure is still a failure — but it never leaves the card claimed by an
+    // agent that is gone.
+    expect(result.status).toBe('failed');
+    expect(result.error).toContain('workspace must be clean');
+    expect(fixture.effects).toEqual([
+      'get',
+      'claim',
+      'block:Run failed: Step "preflight-git" failed: ' +
+      'workspace must be clean before the task run starts',
+      'release',
+    ]);
+  });
+
+  test('carries the classification type into the brief the implementer reads', async () => {
+    const fixture = harness({ status: 'backlog', content: '', outputKeys: [] });
+    await createKanbyFactory(fixture.dependencies).run({
+      input: input('true'),
+      claude: fake({
+        classify: classification({ type: 'bug' }),
+        analyze: analysis(),
+        implement: { summary: 'fixed the formatter' },
+        review: review(),
+      }),
+    });
+
+    expect(fixture.updatedContent).toContain('**Task type:** bug');
   });
 });
 
-function input(testCommand: string, maxRevisions = 1) {
+function input(
+  testCommand: string,
+  maxRevisions = 1,
+  overrides: { maxUnattendedRisk?: 'none' | 'low' | 'medium' | 'high' } = {},
+) {
   return {
     taskGuid: '019f-task',
     testCommand,
     maxRevisions,
+    ...overrides,
     gitlab: {
       host: 'https://gitlab.example.internal',
       project: 'group/project',
@@ -291,7 +407,7 @@ function classification(overrides: Partial<ReturnType<typeof classificationDefau
 
 function classificationDefaults() {
   return {
-    type: 'feature' as const,
+    type: 'feature' as 'bug' | 'feature' | 'documentation' | 'chore',
     confidence: 0.95,
     rationale: 'Matches a feature request.',
     requiresHumanTriage: false,
@@ -324,9 +440,9 @@ function reviewDefaults() {
     summary: 'Ready for human review.',
     completeness: 'complete' as 'complete' | 'partial' | 'missing',
     concerns: [] as string[],
-    sideEffectRisk: 'low' as const,
-    performanceRisk: 'none' as const,
-    compatibilityRisk: 'low' as const,
+    sideEffectRisk: 'low' as RiskLevel,
+    performanceRisk: 'none' as RiskLevel,
+    compatibilityRisk: 'low' as RiskLevel,
   };
 }
 
@@ -393,10 +509,10 @@ function harness(taskOverrides: Partial<KanbyTask> = {}) {
 
   const repository = {
     async preflight() {
-      effects.push('preflight');
+      effects.push('preflight-git');
     },
-    async stage() {
-      effects.push('stage-change');
+    async stage(_workspace: string, _branch: string, maxDiffBytes: number) {
+      effects.push(`stage-change:${maxDiffBytes}`);
       return { truncated: false };
     },
     async commit() {

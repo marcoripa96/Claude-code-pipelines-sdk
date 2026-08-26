@@ -63,8 +63,12 @@ describe('the kanby-software-factory Git adapter', () => {
     ).resolves.toBeUndefined();
 
     await Bun.write(join(workspace, 'change.txt'), 'implemented\n');
-    const staged = await repository.stage(workspace, destination.sourceBranch, signal);
+    const staged = await repository.stage(workspace, destination.sourceBranch, 100_000, signal);
     expect(staged.truncated).toBe(false);
+
+    // The size ceiling is pipeline policy, passed in rather than baked into the seam.
+    const tiny = await repository.stage(workspace, destination.sourceBranch, 8, signal);
+    expect(tiny.truncated).toBe(true);
 
     const task: KanbyTask = {
       guid: '019f-task',

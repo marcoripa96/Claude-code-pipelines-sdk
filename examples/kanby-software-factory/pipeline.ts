@@ -1,10 +1,13 @@
 import {
   definePipeline,
+  isHalt,
   type ClaudeHandle,
 } from '@marcoripa96/claude-code-pipelines-sdk';
 import { z } from 'zod';
 
 export type TaskStatus = 'backlog' | 'todo' | 'in_progress' | 'in_review' | 'done';
+
+export type RiskLevel = 'none' | 'low' | 'medium' | 'high';
 
 export interface KanbyTask {
   guid: string;
@@ -83,6 +86,7 @@ export interface RepositoryClient {
   stage(
     workspace: string,
     sourceBranch: string,
+    maxDiffBytes: number,
     signal: AbortSignal,
   ): Promise<{ truncated: boolean }>;
   commit(
@@ -132,10 +136,22 @@ export interface KanbyFactoryDependencies {
   checks: ChecksClient;
 }
 
+const risk = z.enum(['none', 'low', 'medium', 'high']);
+
 const input = z.object({
   taskGuid: z.string().min(1),
   testCommand: z.string().min(1).default('bun test'),
   maxRevisions: z.number().int().min(0).max(5).default(1),
+  /** Below this, classification is a question for a human rather than an answer. */
+  minConfidence: z.number().min(0).max(1).default(0.8),
+  /**
+   * The highest review risk that may reach a merge request unattended. Above it the
+   * factory stops and a human decides — the pipeline's version of review depth
+   * scaling with risk.
+   */
+  maxUnattendedRisk: risk.default('medium'),
+  /** A change larger than this is handed to a human rather than reviewed by a model. */
+  maxDiffBytes: z.number().int().min(1).default(100_000),
   gitlab: z.object({
     host: z.string().url(),
     project: z.string().min(1),
@@ -144,20 +160,30 @@ const input = z.object({
   }),
 });
 
+/** The two preparation outputs that make a `todo` task self-contained. */
+const PREPARATION_KEYS = [
+  'kanby-software-factory/classification',
+  'kanby-software-factory/analysis',
+];
+
+/** Read-only sessions: they answer, the pipeline writes. */
+const READ_ONLY_TOOLS = ['Bash', 'Read', 'Grep', 'Glob'];
+
 /**
  * One pipeline for every open task: it reads where the task is on the board and
  * runs exactly the stages that stage still needs. A `backlog` task goes through
  * intake (classify -> analyze -> brief -> todo) and straight on into delivery; a
- * `todo` task skips intake and starts at implementation. Stages a run did not
- * need are recorded as skipped, so the run record reads as the task's progress
- * through the factory.
+ * `todo` task skips intake and starts at implementation.
  *
  * Step boundaries follow one rule: a step has exactly one observable outcome —
  * a decision (a Claude Output), one transition of one system of record, or a
- * gate verdict. Formatting and branching are code between steps; every board,
- * git and GitLab write is its own step; the five handoff paths share one ritual
- * (`handoff-block` -> `handoff-release`) so "stop and leave the card free for a
- * human" is written once.
+ * gate verdict. The rule is not taste: a step is the SDK's unit of record,
+ * retry, timeout and replay at once, so two systems of record in one step could
+ * not be retried without repeating half of it.
+ *
+ * Every way this pipeline stops after claiming — a gate, or a thrown step —
+ * runs the same handoff ritual (`handoff-block` -> `handoff-release`), so a
+ * stopped run never leaves the card claimed by an agent that is gone.
  */
 export function createKanbyFactory({
   kanby,
@@ -177,12 +203,15 @@ export function createKanbyFactory({
       'publish-analysis',
       'write-brief',
       'move-todo',
-      'preflight',
+      // One system of record per step, gates included: a failure names the system
+      // that is not provisioned rather than "preflight".
+      'preflight-git',
+      'preflight-gitlab',
       'move-in-progress',
       'implement',
       'publish-implementation',
-      'test',
-      'publish-test',
+      'check',
+      'publish-checks',
       'stage-change',
       'review',
       'publish-review',
@@ -192,9 +221,9 @@ export function createKanbyFactory({
       'link-development',
       'move-in-review',
       'release',
-      // The shared handoff ritual. Declared last because any halt path may run
-      // it; revision rounds extend `implement`, `test` and `review` with a
-      // `-2`, `-3`, ... suffix, which stays undeclared by design.
+      // The shared handoff ritual. Declared last because any stop may run it;
+      // revision rounds re-run the loop's seven steps under a `-2`, `-3`, ...
+      // suffix, which stays undeclared by design.
       'handoff-block',
       'handoff-release',
     ],
@@ -203,282 +232,424 @@ export function createKanbyFactory({
       const task = await ctx.step('fetch-task', (signal) =>
         kanby.get(ctx.input.taskGuid, ctx.workspace, signal),
       );
+
+      // Every guard that the fetched snapshot alone can decide runs before the
+      // claim, so refusing a task never has to undo one.
       if (task.blocked) ctx.halt(`task is blocked: ${task.blocked.reason}`);
       if (task.status !== 'backlog' && task.status !== 'todo') {
         ctx.halt(`factory requires backlog or todo, got ${task.status}`);
       }
-
-      await ctx.step('claim', (signal) => kanby.claim(task, ctx.workspace, signal));
-      const taskLabel = label(task);
       const intake = task.status === 'backlog';
-      let brief = task.content.trim();
-
-      // Every stop-and-ask-a-human path is this ritual: record why on the card,
-      // then leave the card free for a human to act on. Declared once so the
-      // invariant "a handoff always releases the claim" holds everywhere.
-      const handOffToHuman = (reason: string): Promise<never> =>
-        ctx
-          .step('handoff-block', (signal) => kanby.block(task.guid, reason, ctx.workspace, signal))
-          .then(() => ctx.step('handoff-release', (signal) => kanby.release(task.guid, ctx.workspace, signal)))
-          .then(() => ctx.halt(reason));
-
-      if (intake) {
-        const classification = await ctx.claude({
-          name: 'classify',
-          prompt:
-            `You are classifying kanby task ${taskLabel}.\n\n` +
-            `1. Read the task: kanby show ${task.guid}\n` +
-            `2. Decide its type, your confidence, and whether it needs human triage ` +
-            `before any technical work.\n\n` +
-            `Answer through the structured output. Read-only: change nothing on the ` +
-            `board or in the workspace.`,
-          output: z.object({
-            type: z.enum(['bug', 'feature', 'documentation', 'chore']),
-            confidence: z.number().min(0).max(1),
-            rationale: z.string(),
-            requiresHumanTriage: z.boolean(),
-          }),
-        });
-
-        await ctx.step('publish-classification', (signal) =>
-          kanby.putOutput(
-            task.guid,
-            {
-              key: 'kanby-software-factory/classification',
-              title: 'Classification',
-              body: formatClassification(classification.output),
-            },
-            ctx.workspace,
-            signal,
-          ),
-        );
-        if (classification.output.requiresHumanTriage || classification.output.confidence < 0.8) {
-          const reason = classification.output.requiresHumanTriage
-            ? `Classification requires human triage: ${classification.output.rationale}`
-            : `Classification confidence is ${classification.output.confidence}: ${classification.output.rationale}`;
-          await handOffToHuman(reason);
-        }
-
-        const analysis = await ctx.claude({
-          name: 'analyze',
-          prompt:
-            `You are analysing kanby task ${taskLabel} to decide whether it is ready to ` +
-            `be implemented.\n\n` +
-            `1. Read the task: kanby show ${task.guid}\n` +
-            `2. Ground yourself in the actual repository. Run throwaway probes where ` +
-            `reading is not enough, and leave the workspace exactly as you found it.\n` +
-            `3. Say what you could not verify instead of inventing it; put verification ` +
-            `first in the plan when something material is unconfirmed.\n` +
-            `4. Produce evidence, specification, plan, compatibility and risk through ` +
-            `the structured output.\n\n` +
-            `Never commit, push or mutate the board.`,
-          output: z.object({
-            ready: z.boolean(),
-            reason: z.string(),
-            evidence: z.array(z.string()),
-            specification: z.string(),
-            plan: z.array(z.string()),
-            compatibility: z.string(),
-            risk: z.enum(['low', 'medium', 'high']),
-            requiredChecks: z.array(z.string()),
-          }),
-          retry: 2,
-        });
-        brief = formatAnalysis(analysis.output);
-
-        await ctx.step('publish-analysis', (signal) =>
-          kanby.putOutput(
-            task.guid,
-            {
-              key: 'kanby-software-factory/analysis',
-              title: 'Analysis',
-              body: brief,
-            },
-            ctx.workspace,
-            signal,
-          ),
-        );
-        if (!analysis.output.ready) {
-          await handOffToHuman(analysis.output.reason);
-        }
-        await ctx.step('write-brief', (signal) =>
-          kanby.update(task.guid, { content: brief }, ctx.workspace, signal),
-        );
-        await ctx.step('move-todo', (signal) => kanby.move(task.guid, 'todo', ctx.workspace, signal));
-      } else if (
-        !['kanby-software-factory/classification', 'kanby-software-factory/analysis'].every(
-          (key) => task.outputKeys.includes(key),
-        )
-      ) {
-        await ctx.step('release', (signal) => kanby.release(task.guid, ctx.workspace, signal));
+      if (!intake && !PREPARATION_KEYS.every((key) => task.outputKeys.includes(key))) {
         ctx.halt('todo task is missing preparation outputs');
       }
 
-      await ctx.step('preflight', async (signal) => {
-        await repository.preflight(ctx.workspace, ctx.input.gitlab, signal);
-        await mergeRequests.preflight(ctx.input.gitlab, signal);
-      });
-      await ctx.step('move-in-progress', (signal) =>
-        kanby.move(task.guid, 'in_progress', ctx.workspace, signal),
-      );
+      await ctx.step('claim', (signal) => kanby.claim(task, ctx.workspace, signal));
+      const taskLabel = label(task);
 
-      let review!: ClaudeHandle<{
-        summary: string;
-        completeness: 'complete' | 'partial' | 'missing';
-        concerns: string[];
-        sideEffectRisk: 'none' | 'low' | 'medium' | 'high';
-        performanceRisk: 'none' | 'low' | 'medium' | 'high';
-        compatibilityRisk: 'none' | 'low' | 'medium' | 'high';
-      }>;
-      for (let round = 1; ; round++) {
-        const suffix = round === 1 ? '' : `-${round}`;
-        const implementation = await ctx.claude({
-          name: round === 1 ? 'implement' : `implement-revise${suffix}`,
-          prompt: round === 1
-            ? `You are implementing kanby task ${taskLabel}.\n\n` +
-              `1. Read the task: kanby show ${task.guid} — its content is the prepared brief.\n` +
-              `2. Implement the brief in this workspace, as written. If the brief turns out ` +
-              `to be wrong, follow it as far as it holds and say so in your summary.\n` +
-              `3. Do not commit, push or touch the board: the pipeline publishes and ` +
-              `records those effects itself.\n\n` +
-              `Summarise what you did through the structured output.`
-            : `You are revising kanby task ${taskLabel} after review round ${round - 1} ` +
-              `flagged concerns.\n\n` +
-              `1. Read the task: kanby show ${task.guid} — its content is the prepared ` +
-              `brief, and its Review output holds the concerns to address.\n` +
-              `2. Revise the implementation in this workspace.\n` +
-              `3. Do not commit, push or touch the board: the pipeline publishes and ` +
-              `records those effects itself.\n\n` +
-              `Summarise the revision through the structured output.`,
-          output: z.object({ summary: z.string() }),
-        });
+      // Every stop-and-ask-a-human path is this ritual: record why on the card,
+      // then leave the card free for a human to act on. Declared once so the
+      // invariant "a stop always releases the claim" holds everywhere.
+      const handOffToHuman = (reason: string): Promise<never> =>
+        ctx
+          .step('handoff-block', (signal) => kanby.block(task.guid, reason, ctx.workspace, signal))
+          .then(() =>
+            ctx.step('handoff-release', (signal) =>
+              kanby.release(task.guid, ctx.workspace, signal),
+            ),
+          )
+          .then(() => ctx.halt(reason));
 
-        await ctx.step('publish-implementation', (signal) =>
-          kanby.putOutput(
-            task.guid,
-            {
-              key: 'kanby-software-factory/implementation',
-              title: 'Implementation',
-              body: implementation.output.summary,
-            },
-            ctx.workspace,
-            signal,
-          ),
-        );
+      try {
+        await stages();
+      } catch (error) {
+        if (isHalt(error)) throw error;
+        // A thrown step is the factory's other way of stopping — usually something
+        // it needs is not provisioned. Same ritual, best-effort so a board that is
+        // itself unreachable cannot mask the failure that got us here, and the
+        // original error still fails the run.
+        await handOffOnFailure(error);
+        throw error;
+      }
 
-        const tests = await ctx.step(`test${suffix}`, (signal) =>
-          checks.run(ctx.workspace, ctx.input.testCommand, signal),
-        );
-        const checksBody = formatCommandOutput(
-          ctx.input.testCommand,
-          tests.exitCode,
-          tests.stdout,
-          tests.stderr,
-        );
-        await ctx.step('publish-test', (signal) =>
-          kanby.putOutput(
-            task.guid,
-            {
-              key: 'kanby-software-factory/checks',
-              title: 'Checks',
-              body: checksBody,
-            },
-            ctx.workspace,
-            signal,
-          ),
-        );
+      async function stages(): Promise<void> {
+        let brief = task.content.trim();
+        let type: string | undefined;
 
-        if (tests.exitCode !== 0) {
-          await handOffToHuman(
-            `Check command exited ${tests.exitCode}: ${ctx.input.testCommand}`,
+        if (intake) {
+          const classification = await ctx.claude({
+            name: 'classify',
+            prompt:
+              `You are classifying kanby task ${taskLabel}.\n\n` +
+              `1. Read the task: kanby show ${task.guid}\n` +
+              `2. Decide its type, your confidence, and whether it needs human triage ` +
+              `before any technical work.\n\n` +
+              `Answer through the structured output.`,
+            output: z.object({
+              type: z.enum(['bug', 'feature', 'documentation', 'chore']),
+              confidence: z.number().min(0).max(1),
+              rationale: z.string(),
+              requiresHumanTriage: z.boolean(),
+            }),
+            // Reading the board is all this session may do. Enforced here rather
+            // than asked for in the prompt.
+            allowedTools: ['Bash'],
+          });
+          type = classification.output.type;
+
+          await ctx.step('publish-classification', (signal) =>
+            kanby.putOutput(
+              task.guid,
+              {
+                key: PREPARATION_KEYS[0]!,
+                title: 'Classification',
+                body: formatClassification(classification.output),
+              },
+              ctx.workspace,
+              signal,
+            ),
+          );
+          if (
+            classification.output.requiresHumanTriage ||
+            classification.output.confidence < ctx.input.minConfidence
+          ) {
+            const reason = classification.output.requiresHumanTriage
+              ? `Classification requires human triage: ${classification.output.rationale}`
+              : `Classification confidence is ${classification.output.confidence}: ${classification.output.rationale}`;
+            await handOffToHuman(reason);
+          }
+
+          const analysis = await ctx.claude({
+            name: 'analyze',
+            prompt:
+              `You are analysing kanby task ${taskLabel} (classified as a ` +
+              `${classification.output.type}) to decide whether it is ready to be ` +
+              `implemented.\n\n` +
+              `1. Read the task: kanby show ${task.guid}\n` +
+              `2. Ground yourself in the actual repository. Run throwaway probes where ` +
+              `reading is not enough, and leave the workspace exactly as you found it.\n` +
+              `3. Quote the probe you ran as evidence, so the implementer can re-run it ` +
+              `rather than trust it.\n` +
+              `4. Say what you could not verify instead of inventing it; put verification ` +
+              `first in the plan when something material is unconfirmed.\n` +
+              `5. Produce evidence, specification, plan, compatibility and risk through ` +
+              `the structured output.`,
+            output: z.object({
+              ready: z.boolean(),
+              reason: z.string(),
+              evidence: z.array(z.string()),
+              specification: z.string(),
+              plan: z.array(z.string()),
+              compatibility: z.string(),
+              risk: z.enum(['low', 'medium', 'high']),
+              requiredChecks: z.array(z.string()),
+            }),
+            allowedTools: READ_ONLY_TOOLS,
+            // The only session whose Output gates a column move, and the only one
+            // whose work a human cannot cheaply redo from the card.
+            retry: 2,
+          });
+          brief = formatAnalysis(analysis.output, classification.output.type);
+
+          await ctx.step('publish-analysis', (signal) =>
+            kanby.putOutput(
+              task.guid,
+              {
+                key: PREPARATION_KEYS[1]!,
+                title: 'Analysis',
+                body: brief,
+              },
+              ctx.workspace,
+              signal,
+            ),
+          );
+          if (!analysis.output.ready) {
+            await handOffToHuman(analysis.output.reason);
+          }
+          // The brief is the authoritative copy from here on: a human editing it
+          // during a restart changes what the implementer reads, and the Analysis
+          // block stays as the record of what the factory originally proposed.
+          await ctx.step('write-brief', (signal) =>
+            kanby.update(task.guid, { content: brief }, ctx.workspace, signal),
+          );
+          await ctx.step('move-todo', (signal) =>
+            kanby.move(task.guid, 'todo', ctx.workspace, signal),
           );
         }
 
-        const staged = await ctx.step('stage-change', (signal) =>
-          repository.stage(ctx.workspace, ctx.input.gitlab.sourceBranch, signal),
+        await ctx.step('preflight-git', (signal) =>
+          repository.preflight(ctx.workspace, ctx.input.gitlab, signal),
         );
-        if (staged.truncated) {
-          await handOffToHuman('Change is too large for automated review');
+        await ctx.step('preflight-gitlab', (signal) =>
+          mergeRequests.preflight(ctx.input.gitlab, signal),
+        );
+        await ctx.step('move-in-progress', (signal) =>
+          kanby.move(task.guid, 'in_progress', ctx.workspace, signal),
+        );
+
+        let review!: ClaudeHandle<{
+          summary: string;
+          completeness: 'complete' | 'partial' | 'missing';
+          concerns: string[];
+          sideEffectRisk: RiskLevel;
+          performanceRisk: RiskLevel;
+          compatibilityRisk: RiskLevel;
+        }>;
+        for (let round = 1; ; round++) {
+          // Every step in the loop carries the round, so a two-round run reads as
+          // fourteen distinct records rather than seven names appearing twice.
+          const suffix = round === 1 ? '' : `-${round}`;
+          const implementation = await ctx.claude({
+            name: `implement${suffix}`,
+            prompt: round === 1
+              ? `You are implementing kanby task ${taskLabel}.\n\n` +
+                `1. Read the task: kanby show ${task.guid} — its content is the prepared brief.\n` +
+                `2. Implement the brief in this workspace, as written. If the brief turns out ` +
+                `to be wrong, follow it as far as it holds and say so in your summary.\n` +
+                `3. Do not commit, push or touch the board: the pipeline publishes and ` +
+                `records those effects itself.\n\n` +
+                `Summarise what you did through the structured output.`
+              : `You are revising kanby task ${taskLabel} after review round ${round - 1} ` +
+                `flagged concerns.\n\n` +
+                `1. Read the task: kanby show ${task.guid} — its content is the prepared ` +
+                `brief, and its Review output holds the concerns to address.\n` +
+                `2. Revise the implementation in this workspace.\n` +
+                `3. Do not commit, push or touch the board: the pipeline publishes and ` +
+                `records those effects itself.\n\n` +
+                `Summarise the revision through the structured output.`,
+            output: z.object({ summary: z.string() }),
+            // Publishing is the pipeline's job in every case; denying it here means
+            // a session cannot half-publish by accident.
+            disallowedTools: ['Bash(git commit:*)', 'Bash(git push:*)'],
+          });
+
+          await ctx.step(`publish-implementation${suffix}`, (signal) =>
+            kanby.putOutput(
+              task.guid,
+              {
+                key: 'kanby-software-factory/implementation',
+                title: 'Implementation',
+                body: withRound(round, implementation.output.summary),
+              },
+              ctx.workspace,
+              signal,
+            ),
+          );
+
+          const checked = await ctx.step(`check${suffix}`, (signal) =>
+            checks.run(ctx.workspace, ctx.input.testCommand, signal),
+          );
+          await ctx.step(`publish-checks${suffix}`, (signal) =>
+            kanby.putOutput(
+              task.guid,
+              {
+                key: 'kanby-software-factory/checks',
+                title: 'Checks',
+                body: withRound(
+                  round,
+                  formatCommandOutput(
+                    ctx.input.testCommand,
+                    checked.exitCode,
+                    checked.stdout,
+                    checked.stderr,
+                  ),
+                ),
+              },
+              ctx.workspace,
+              signal,
+            ),
+          );
+
+          if (checked.exitCode !== 0) {
+            await handOffToHuman(
+              `Check command exited ${checked.exitCode}: ${ctx.input.testCommand}`,
+            );
+          }
+
+          const staged = await ctx.step(`stage-change${suffix}`, (signal) =>
+            repository.stage(
+              ctx.workspace,
+              ctx.input.gitlab.sourceBranch,
+              ctx.input.maxDiffBytes,
+              signal,
+            ),
+          );
+          if (staged.truncated) {
+            await handOffToHuman(
+              `Change is larger than ${ctx.input.maxDiffBytes} bytes and was not reviewed`,
+            );
+          }
+
+          review = await ctx.claude({
+            name: `review${suffix}`,
+            prompt:
+              `You are reviewing kanby task ${taskLabel} before a human reviewer does.\n\n` +
+              `1. Read the task: kanby show ${task.guid} — its content is the prepared ` +
+              `brief, and its Checks output holds the recorded check run.\n` +
+              `2. Get the change: git diff --cached\n` +
+              `3. Judge completeness against the brief and the change's side-effect, ` +
+              `performance and compatibility risk. Your risk scores decide how much ` +
+              `human attention this change gets, so score the change, not your ` +
+              `confidence in it.\n\n` +
+              `Review, do not fix. Answer through the structured output.`,
+            output: z.object({
+              summary: z.string(),
+              completeness: z.enum(['complete', 'partial', 'missing']),
+              concerns: z.array(z.string()),
+              sideEffectRisk: risk,
+              performanceRisk: risk,
+              compatibilityRisk: risk,
+            }),
+            // A reviewer that edits the tree would invalidate the diff it was given
+            // and make `commit` refuse. Read-only makes that unreachable rather
+            // than merely discouraged.
+            allowedTools: READ_ONLY_TOOLS,
+          });
+
+          await ctx.step(`publish-review${suffix}`, (signal) =>
+            kanby.putOutput(
+              task.guid,
+              {
+                key: 'kanby-software-factory/review',
+                title: 'Review',
+                body: withRound(round, formatReview(review.output)),
+              },
+              ctx.workspace,
+              signal,
+            ),
+          );
+
+          const concerns =
+            review.output.completeness !== 'complete' || review.output.concerns.length > 0;
+          if (!concerns) break;
+          if (round > ctx.input.maxRevisions) {
+            const reason =
+              review.output.concerns.join('; ') || `Implementation is ${review.output.completeness}`;
+            await handOffToHuman(reason);
+          }
         }
 
-        review = await ctx.claude({
-          name: `review${suffix}`,
-          prompt:
-            `You are reviewing kanby task ${taskLabel} before a human reviewer does.\n\n` +
-            `1. Read the task: kanby show ${task.guid} — its content is the prepared ` +
-            `brief, and its Checks output holds the recorded check run.\n` +
-            `2. Get the change: git diff --cached\n` +
-            `3. Judge completeness against the brief and the change's side-effect, ` +
-            `performance and compatibility risk.\n\n` +
-            `Review, do not fix. Answer through the structured output.`,
-          output: z.object({
-            summary: z.string(),
-            completeness: z.enum(['complete', 'partial', 'missing']),
-            concerns: z.array(z.string()),
-            sideEffectRisk: z.enum(['none', 'low', 'medium', 'high']),
-            performanceRisk: z.enum(['none', 'low', 'medium', 'high']),
-            compatibilityRisk: z.enum(['none', 'low', 'medium', 'high']),
-          }),
-        });
+        // Review depth scales with risk. The board has one review column, so the
+        // only depth this pipeline can express is "a human decides before this is
+        // published at all" — and the scores the reviewer produced are what decides.
+        const peak = peakRisk(review.output);
+        if (rank(peak.level) > rank(ctx.input.maxUnattendedRisk)) {
+          await handOffToHuman(
+            `${peak.dimension} risk is ${peak.level}, above the unattended ceiling ` +
+            `${ctx.input.maxUnattendedRisk}: a human decides before this is published`,
+          );
+        }
 
-        await ctx.step('publish-review', (signal) =>
-          kanby.putOutput(
-            task.guid,
+        const commit = await ctx.step('commit', (signal) =>
+          repository.commit(ctx.workspace, task, ctx.input.gitlab.sourceBranch, signal),
+        );
+        await ctx.step('push', (signal) =>
+          repository.push(ctx.workspace, ctx.input.gitlab, commit.sha, signal),
+        );
+
+        // One system of record per step: GitLab owns the merge request, Kanby
+        // owns the task's development link to it.
+        const mergeRequest = await ctx.step('open-merge-request', (signal) =>
+          mergeRequests.ensure(
             {
-              key: 'kanby-software-factory/review',
-              title: 'Review',
-              body: formatReview(review.output),
+              host: ctx.input.gitlab.host,
+              project: ctx.input.gitlab.project,
+              sourceBranch: ctx.input.gitlab.sourceBranch,
+              targetBranch: ctx.input.gitlab.targetBranch,
+              title: `${taskLabel} ${task.title}`,
+              description: mergeRequestDescription(task, review.output, type),
             },
-            ctx.workspace,
             signal,
           ),
         );
-
-        const concerns =
-          review.output.completeness !== 'complete' || review.output.concerns.length > 0;
-        if (!concerns) break;
-        if (round > ctx.input.maxRevisions) {
-          const reason =
-            review.output.concerns.join('; ') || `Implementation is ${review.output.completeness}`;
-          await handOffToHuman(reason);
-        }
+        await ctx.step('link-development', (signal) =>
+          kanby.linkMergeRequest(task.guid, mergeRequest, ctx.workspace, signal),
+        );
+        await ctx.step('move-in-review', (signal) =>
+          kanby.move(task.guid, 'in_review', ctx.workspace, signal),
+        );
+        await ctx.step('release', (signal) => kanby.release(task.guid, ctx.workspace, signal));
       }
 
-      const commit = await ctx.step('commit', (signal) =>
-        repository.commit(ctx.workspace, task, ctx.input.gitlab.sourceBranch, signal),
-      );
-      await ctx.step('push', (signal) =>
-        repository.push(ctx.workspace, ctx.input.gitlab, commit.sha, signal),
-      );
-
-      // One system of record per step: GitLab owns the merge request, Kanby
-      // owns the task's development link to it.
-      const mergeRequest = await ctx.step('open-merge-request', (signal) =>
-        mergeRequests.ensure(
-          {
-            host: ctx.input.gitlab.host,
-            project: ctx.input.gitlab.project,
-            sourceBranch: ctx.input.gitlab.sourceBranch,
-            targetBranch: ctx.input.gitlab.targetBranch,
-            title: `${taskLabel} ${task.title}`,
-            description: `${review.output.summary}\n\nKanby task: ${task.guid}`,
-          },
-          signal,
-        ),
-      );
-      await ctx.step('link-development', (signal) =>
-        kanby.linkMergeRequest(task.guid, mergeRequest, ctx.workspace, signal),
-      );
-      await ctx.step('move-in-review', (signal) =>
-        kanby.move(task.guid, 'in_review', ctx.workspace, signal),
-      );
-      await ctx.step('release', (signal) => kanby.release(task.guid, ctx.workspace, signal));
+      async function handOffOnFailure(error: unknown): Promise<void> {
+        const reason = `Run failed: ${describe(error)}`;
+        try {
+          await ctx.step('handoff-block', (signal) =>
+            kanby.block(task.guid, reason, ctx.workspace, signal),
+          );
+        } catch {
+          // The original failure is the one worth reporting.
+        }
+        try {
+          await ctx.step('handoff-release', (signal) =>
+            kanby.release(task.guid, ctx.workspace, signal),
+          );
+        } catch {
+          // Same: a card left claimed is visible on the board, a swallowed cause is not.
+        }
+      }
     },
   });
 }
 
+const RISK_ORDER: RiskLevel[] = ['none', 'low', 'medium', 'high'];
+
+function rank(level: RiskLevel): number {
+  return RISK_ORDER.indexOf(level);
+}
+
+/** The dimension a human should look at first, and how hard. */
+function peakRisk(output: {
+  sideEffectRisk: RiskLevel;
+  performanceRisk: RiskLevel;
+  compatibilityRisk: RiskLevel;
+}): { dimension: string; level: RiskLevel } {
+  const dimensions = [
+    { dimension: 'Side-effect', level: output.sideEffectRisk },
+    { dimension: 'Performance', level: output.performanceRisk },
+    { dimension: 'Compatibility', level: output.compatibilityRisk },
+  ];
+  return dimensions.reduce((peak, next) => (rank(next.level) > rank(peak.level) ? next : peak));
+}
+
+/** What the peak risk asks of the human who opens the merge request. */
+function reviewDepth(level: RiskLevel): string {
+  if (level === 'high') return 'deep review';
+  if (level === 'medium') return 'focused review';
+  return 'quick verification';
+}
+
 function label(task: KanbyTask): string {
   return task.displayNumber === null ? task.guid : `#${task.displayNumber}`;
+}
+
+function withRound(round: number, body: string): string {
+  return round === 1 ? body : `**Revision round ${round}**\n\n${body}`;
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function mergeRequestDescription(
+  task: KanbyTask,
+  output: {
+    summary: string;
+    sideEffectRisk: RiskLevel;
+    performanceRisk: RiskLevel;
+    compatibilityRisk: RiskLevel;
+  },
+  type: string | undefined,
+): string {
+  const peak = peakRisk(output);
+  return [
+    output.summary,
+    '',
+    `**Suggested review depth:** ${reviewDepth(peak.level)} — ` +
+    `${peak.dimension.toLowerCase()} risk is ${peak.level}.`,
+    '',
+    type ? `Kanby task: ${task.guid} (${type})` : `Kanby task: ${task.guid}`,
+  ].join('\n');
 }
 
 function formatClassification(output: {
@@ -496,17 +667,22 @@ function formatClassification(output: {
   ].join('\n');
 }
 
-function formatAnalysis(output: {
-  ready: boolean;
-  reason: string;
-  evidence: string[];
-  specification: string;
-  plan: string[];
-  compatibility: string;
-  risk: string;
-  requiredChecks: string[];
-}): string {
+function formatAnalysis(
+  output: {
+    ready: boolean;
+    reason: string;
+    evidence: string[];
+    specification: string;
+    plan: string[];
+    compatibility: string;
+    risk: string;
+    requiredChecks: string[];
+  },
+  type: string,
+): string {
   return [
+    `**Task type:** ${type}`,
+    '',
     output.reason,
     '',
     '## Evidence',
@@ -551,9 +727,9 @@ function formatReview(output: {
   summary: string;
   completeness: string;
   concerns: string[];
-  sideEffectRisk: string;
-  performanceRisk: string;
-  compatibilityRisk: string;
+  sideEffectRisk: RiskLevel;
+  performanceRisk: RiskLevel;
+  compatibilityRisk: RiskLevel;
 }): string {
   const concerns = output.concerns.length > 0
     ? ['## Concerns', '', ...output.concerns.map((concern) => `- ${concern}`), '']
@@ -565,6 +741,7 @@ function formatReview(output: {
     `**Side-effect risk:** ${output.sideEffectRisk}`,
     `**Performance risk:** ${output.performanceRisk}`,
     `**Compatibility risk:** ${output.compatibilityRisk}`,
+    `**Suggested review depth:** ${reviewDepth(peakRisk(output).level)}`,
     '',
     ...concerns,
   ].join('\n').trimEnd();
