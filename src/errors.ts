@@ -64,6 +64,58 @@ export class ClaudeStepError extends Error {
   }
 }
 
+/**
+ * A resumed run reached a step that a crash left in flight, and nothing could settle
+ * whether its work landed: it declared no `reconcile`, or one that could not answer, and
+ * its crash policy is `'fail'`.
+ *
+ * This is the run stopping rather than guessing. Establish what happened, then resume
+ * again — a step whose effect turns out to have landed is settled by giving it a
+ * `reconcile`; one that did not is settled by `onCrash: 'rerun'`.
+ */
+export class IndeterminateStepError extends Error {
+  readonly stepName: string;
+  /** Id of the step, in the crashed run, that was left in flight. */
+  readonly priorStepId: string;
+
+  constructor(stepName: string, priorStepId: string) {
+    super(
+      `Step "${stepName}" was left in flight by a run that stopped, and it is not known ` +
+        'whether its work took effect. Give it a `reconcile` to ask, or `onCrash: ' +
+        "'rerun'` if repeating it is safe.",
+    );
+    this.name = 'IndeterminateStepError';
+    this.stepName = stepName;
+    this.priorStepId = priorStepId;
+  }
+}
+
+/**
+ * Another process claimed the abandoned run this one tried to take over. Two supervisors
+ * polling the same stale run is the ordinary case, not an error in either of them: the
+ * one that loses stops, and the one that won finishes the work.
+ */
+export class RunTakenError extends Error {
+  readonly runId: string;
+
+  constructor(runId: string) {
+    super(`Run ${runId} was taken over by another process; this recovery stops here.`);
+    this.name = 'RunTakenError';
+    this.runId = runId;
+  }
+}
+
+/** A run id was handed to `resumeFrom`, but no adapter could load it. */
+export class RunNotFoundError extends Error {
+  readonly runId: string;
+
+  constructor(runId: string) {
+    super(`No run with id ${runId} could be read from storage.`);
+    this.name = 'RunNotFoundError';
+    this.runId = runId;
+  }
+}
+
 /** The value passed as a run's `input` did not satisfy the pipeline's input schema. */
 export class PipelineInputError extends Error {
   constructor(pipeline: string, cause: unknown) {

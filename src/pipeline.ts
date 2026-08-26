@@ -4,10 +4,12 @@ import type {
   CacheAdapter,
   RunEvents,
   RunResult,
+  RunStore,
   Schema,
   StorageAdapter,
+  WorkspaceSnapshots,
 } from './types.ts';
-import { PipelineInputError, isHalt } from './errors.ts';
+import { PipelineInputError, RunNotFoundError, isHalt } from './errors.ts';
 import { Runner } from './runner.ts';
 import { RunContext } from './context.ts';
 
@@ -44,15 +46,43 @@ export interface RunOptions<I> {
    * than the eight sessions before it.
    *
    * Take it from the `RunResult` the earlier `run()` returned, or from one you rebuilt
-   * yourself: storage is write-only by ADR 0003, so the SDK never reads it back.
+   * yourself. A run id may be given instead, which the storage adapter loads — that
+   * needs an adapter implementing the optional read path (ADR 0009).
    */
-  resumeFrom?: RunResult;
+  resumeFrom?: RunResult | string;
+  /**
+   * Captures the workspace after each step, so a resumed run continues against the tree
+   * its replayed steps left behind rather than an untouched one (ADR 0011).
+   */
+  snapshots?: WorkspaceSnapshots;
+  /**
+   * How often to renew this run's lease, in milliseconds. Only has an effect when the
+   * storage adapter records heartbeats; defaults to 15 seconds.
+   */
+  heartbeatMs?: number;
+}
+
+/** What `recover()` needs beyond the run it is picking up. */
+export interface RecoverOptions<I>
+  extends Omit<RunOptions<I>, 'input' | 'resumeFrom' | 'storage'> {
+  /** The run to take over. Its input, workspace and model come from its own record. */
+  runId: string;
+  /** Must be able to read: recovery starts from a run this process never held. */
+  storage: RunStore;
+  /** Overrides the input the recovered run was started with. Rarely what you want. */
+  input?: I;
 }
 
 export interface Pipeline<I, O> {
   readonly name: string;
   readonly steps: readonly string[];
   run(options: RunOptions<I>): Promise<RunResult<O>>;
+  /**
+   * Picks up a run that stopped — typically one a supervisor found through
+   * `storage.resumable()` — and finishes it. Everything the run was started with is
+   * read back from its own record, so the caller needs nothing but its id.
+   */
+  recover(options: RecoverOptions<I>): Promise<RunResult<O>>;
 }
 
 /**
@@ -64,9 +94,24 @@ export function definePipeline<S extends Schema | undefined = undefined, O = unk
 ): Pipeline<S extends Schema ? InferInput<S> : void, O> {
   type I = S extends Schema ? InferInput<S> : void;
 
-  return {
+  const pipeline: Pipeline<I, O> = {
     name: definition.name,
     steps: definition.steps ?? [],
+
+    async recover(options: RecoverOptions<I>): Promise<RunResult<O>> {
+      const { runId, storage, ...rest } = options;
+      const previous = await storage.readRun(runId);
+      if (!previous) throw new RunNotFoundError(runId);
+      return pipeline.run({
+        ...rest,
+        input: (options.input ?? previous.input) as I,
+        workspace: options.workspace ?? previous.workspace,
+        model: options.model ?? previous.model,
+        storage,
+        resumeFrom: previous,
+      });
+    },
+
     async run(options: RunOptions<I>): Promise<RunResult<O>> {
       let input: unknown = options.input;
       if (definition.input) {
@@ -76,6 +121,8 @@ export function definePipeline<S extends Schema | undefined = undefined, O = unk
           throw new PipelineInputError(definition.name, error);
         }
       }
+
+      const resumeFrom = await resolveResumeFrom(options);
 
       const runner = new Runner({
         pipeline: definition.name,
@@ -89,7 +136,9 @@ export function definePipeline<S extends Schema | undefined = undefined, O = unk
         cache: options.cache,
         claude: options.claude,
         signal: options.signal,
-        resumeFrom: options.resumeFrom,
+        resumeFrom,
+        snapshots: options.snapshots,
+        heartbeatMs: options.heartbeatMs,
       });
 
       const ctx = new RunContext(runner, input as never);
@@ -111,4 +160,27 @@ export function definePipeline<S extends Schema | undefined = undefined, O = unk
       }
     },
   };
+
+  return pipeline;
+}
+
+/**
+ * A run id is resolved through the storage adapter, which must be able to read.
+ * Supplying the record directly stays the primary form — it needs no read path at all,
+ * and the caller usually has it (ADR 0008, as amended by 0009).
+ */
+async function resolveResumeFrom(options: {
+  resumeFrom?: RunResult | string;
+  storage?: StorageAdapter;
+}): Promise<RunResult | undefined> {
+  if (typeof options.resumeFrom !== 'string') return options.resumeFrom;
+  if (!options.storage?.readRun) {
+    throw new Error(
+      'resumeFrom was given a run id, but this run has no storage adapter that can read ' +
+        'one back. Pass a RunResult instead, or use a store implementing readRun().',
+    );
+  }
+  const found = await options.storage.readRun(options.resumeFrom);
+  if (!found) throw new RunNotFoundError(options.resumeFrom);
+  return found;
 }

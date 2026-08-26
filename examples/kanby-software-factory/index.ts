@@ -1,4 +1,4 @@
-import { sqliteStorage } from '@marcoripa96/claude-code-pipelines-sdk';
+import { gitWorkspaceSnapshots, sqliteStorage } from '@marcoripa96/claude-code-pipelines-sdk';
 import {
   gitLabMergeRequests,
   gitRepository,
@@ -18,7 +18,10 @@ async function main(): Promise<void> {
   }
 
   const workspace = required('WORKSPACE');
-  const taskGuid = required('KANBY_TASK_GUID');
+  const recovering = flag('--recover');
+  // A recovered run reads its task, workspace and model back from the record it is
+  // taking over, so nothing about the task is asked for on the command line.
+  const taskGuid = recovering ? '' : required('KANBY_TASK_GUID');
   const actor = required('KANBY_AGENT');
   const kanby = kanbyCli({ actor, apiKey: required('KANBY_API_KEY') });
   const sshAuthSock = process.env.SSH_AUTH_SOCK;
@@ -46,12 +49,30 @@ async function main(): Promise<void> {
   // the step-by-step history a human reads when a run goes wrong.
   const storage = sqliteStorage({ path: process.env.RUN_DB ?? '.pipelines/runs.sqlite' });
 
-  const result = await createKanbyFactory({
+  const factory = createKanbyFactory({
     kanby,
     repository: gitRepository({ sshAuthSock }),
     mergeRequests,
     checks: sandboxedChecks({ executable: required('SANDBOX_RUNNER') }),
-  }).run({
+  });
+
+  // The workspace is a checkout, so a replayed step's edits come back from Git rather
+  // than from re-running the session that made them (ADR 0011).
+  const snapshots = gitWorkspaceSnapshots();
+
+  if (recovering) {
+    const result = await factory.recover({
+      runId: recovering,
+      storage,
+      snapshots,
+      on: progressEvents,
+    });
+    storage.db.close();
+    finish(result);
+    return;
+  }
+
+  const result = await factory.run({
     input: {
       taskGuid,
       testCommand: process.env.TEST_COMMAND ?? 'bun test',
@@ -69,6 +90,7 @@ async function main(): Promise<void> {
     },
     workspace,
     storage,
+    snapshots,
     on: progressEvents,
   });
   storage.db.close();
@@ -85,6 +107,15 @@ function finish(result: { id: string; status: string; haltReason?: string; error
   console.log(result.status, result.haltReason ?? result.error ?? '');
   console.log(`run ${result.id}`);
   if (result.status === 'failed') process.exitCode = 1;
+}
+
+/** The value after a flag, or `undefined` when it was not passed. */
+function flag(name: string): string | undefined {
+  const at = process.argv.indexOf(name);
+  if (at === -1) return undefined;
+  const value = process.argv[at + 1];
+  if (!value) throw new Error(`${name} needs the id of the run to take over`);
+  return value;
 }
 
 function required(name: string): string {

@@ -78,6 +78,7 @@ describe('the kanby-software-factory Git adapter', () => {
       content: '',
       status: 'in_progress',
       blocked: null,
+      claimedBy: null,
       updatedMs: 123,
       outputKeys: [
         'prepare-kanby-task/classification',

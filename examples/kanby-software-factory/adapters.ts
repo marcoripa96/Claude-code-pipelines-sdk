@@ -35,6 +35,8 @@ export function kanbyCli(options: {
   });
 
   return {
+    actor: options.actor,
+
     async get(taskGuid, workspace, signal) {
       const { stdout } = await invoke(workspace, ['show', taskGuid, '--json'], signal);
       const task = JSON.parse(stdout) as {
@@ -45,6 +47,7 @@ export function kanbyCli(options: {
         content: string;
         status: TaskStatus;
         blocked: null | { reason: string };
+        claim: null | { agent: string };
         updated_ms: number;
         outputs: { source: string; key: string }[];
       };
@@ -56,6 +59,7 @@ export function kanbyCli(options: {
         content: task.content,
         status: task.status,
         blocked: task.blocked,
+        claimedBy: task.claim?.agent ?? null,
         updatedMs: task.updated_ms,
         outputKeys: task.outputs
           .filter((output) => output.source === 'claude-code')

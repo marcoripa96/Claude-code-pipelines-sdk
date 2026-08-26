@@ -60,6 +60,42 @@ _Avoid_: abort, cancel, bail, exit
 The state of a step that never ran because the run halted before reaching it.
 _Avoid_: ignored, bypassed
 
+**Replay**:
+Producing a step's result from a previous run's record instead of doing the work again.
+Matched on fingerprint, so a step replays only when its work is identical.
+_Avoid_: skip, cache hit, reuse
+
+**Fingerprint**:
+The identity of a step's work: its declaration, its declared input files, the pipeline
+input, the model, and every upstream Output. Written when the step starts, so a step a
+crash interrupts is still identifiable. Also the cache key of a cacheable step.
+_Avoid_: hash, signature, key
+
+**Indeterminate**:
+The state of a step whose process died while it was running: its work may have landed,
+may have half-landed, may never have started. Neither replayed nor blindly redone.
+_Avoid_: stuck, orphaned, unknown
+
+**Reconcile**:
+Asking the system a step acts on whether its External effect already landed, so a
+recovered run adopts it rather than repeating it.
+_Avoid_: check, verify, dedupe
+
+**Recover**:
+Picking up a run another process left unfinished and carrying it to an end. Distinct from
+resuming, which is a caller re-running a record it already holds.
+_Avoid_: restart, retry, resurrect
+
+**Lease**:
+A run's heartbeat, renewed while it is alive. Gone quiet means its owner is gone and its
+work may be taken.
+_Avoid_: lock, claim, ownership
+
+**Snapshot**:
+The workspace as one step left it, recorded so a later run that replays that step can put
+the tree back. Outputs replay; files do not, without one.
+_Avoid_: checkpoint, backup, image
+
 **Cacheable**:
 The property of a step that has opted in by declaring its inputs. Steps are never
 cacheable by default, and a cacheable step re-runs whenever anything it could depend on
@@ -69,11 +105,23 @@ _Avoid_: memoized, pure, idempotent
 ### Persistence
 
 **Storage adapter**:
-A write-only sink receiving a run's lifecycle and transcripts, so that a consumer with
-its own database records runs there rather than beside it. History, never the live view.
+A sink receiving a run's lifecycle and transcripts, so that a consumer with its own
+database records runs there rather than beside it. History, never the live view. Its
+required half is write-only; the optional half reads runs back, which is what makes them
+recoverable by a process that was not there when they died.
 _Avoid_: logger, reporter, backend
+
+**Run store**:
+A storage adapter that also reads: `readRun`, `resumable`, `heartbeat`. What recovery
+needs, and what `sqliteStorage()` is.
+_Avoid_: database, repository, registry
 
 **Cache adapter**:
 A small keyed store, separate from the storage adapter because caching needs to read back
 what it wrote.
 _Avoid_: cache store, memo table
+
+**Workspace snapshots**:
+An adapter that captures and restores a workspace, so replaying a step restores the files
+it wrote and not only the Output it returned.
+_Avoid_: fs adapter, snapshotter, vcs

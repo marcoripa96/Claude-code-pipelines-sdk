@@ -143,7 +143,9 @@ await pipeline.run({
   cache: sqliteCache('.pipelines/cache.sqlite'),
   claude: fake({ ... }), // fixture Outputs instead of real sessions
   signal,                // an AbortSignal
-  resumeFrom: previous,  // a previous RunResult; unchanged steps replay instead of re-running
+  resumeFrom: previous,  // a previous RunResult, or a run id; unchanged steps replay
+  snapshots: gitWorkspaceSnapshots(),  // restore the workspace a replayed step left behind
+  heartbeatMs: 15_000,   // how often to renew this run's lease
   on: {
     runStarted:  (run)  => {},
     stepStarted: (step) => {},
@@ -177,15 +179,79 @@ covers the Outputs above a step, a step that genuinely produces something differ
 invalidates everything below it, while one that re-runs and produces the same Output
 leaves them replayable.
 
-The SDK never reads your storage (ADR 0003): pass the `RunResult` you were given, or
-rebuild one with your own query — the sqlite adapter records the fingerprint each step
-needs.
+Pass the `RunResult` you were given, or a run id for a store that can read one back.
+
+### Surviving a crash
+
+Resuming handles a failure. A run whose *process* dies is a different problem: its steps
+stop mid-flight, nobody holds its record, and nothing says it stopped. Durability closes
+that (ADR 0009), and recovery is one call:
+
+```ts
+const abandoned = storage.resumable({ pipeline: 'ship-it', staleMs: 60_000 });
+for (const run of abandoned) {
+  await pipeline.recover({ runId: run.id, storage });
+}
+```
+
+`recover()` reads the run's input, workspace and model back from its own record, replays
+what completed, and finishes the rest. The run it takes over is marked `superseded`, so it
+is not offered twice — and the marking is exclusive: two supervisors that both saw the
+same abandoned run do not both finish it, because the one that loses the claim stops with
+`RunTakenError` before any step runs.
+
+**A step a crash interrupted is indeterminate** — its work may have landed, may not have.
+Replaying it would be a lie and redoing it would be a duplicate merge request, so a code
+step stops and says so. Tell it how to find out instead:
+
+```ts
+await ctx.step('open-merge-request', (signal) => gitlab.open(dest, signal), {
+  // Asked only on a recovered run: a value means it already happened and is adopted.
+  reconcile: (signal) => gitlab.find(dest.sourceBranch, signal),
+});
+
+await ctx.step('post-comment', (signal) => post(signal), { onCrash: 'rerun' });
+```
+
+Claude and command steps default to `onCrash: 'rerun'` — they act on the workspace, which
+snapshots restore, so repeating one costs tokens rather than correctness. `ctx.step`
+defaults to `'fail'`, because it is where External effects live.
+
+**Replay restores Outputs, not files.** A replayed session hands back the Output it
+produced, not the forty files it edited. Give the run a `WorkspaceSnapshots` adapter and
+the tree comes back too:
+
+```ts
+await pipeline.run({ input, snapshots: gitWorkspaceSnapshots() });
+```
+
+The Git implementation captures the working tree *and* the index after each step, through
+a scratch index file so your own index is never touched, and keeps each one behind
+`refs/pipelines/<runId>/<step>` where ordinary Git can see it (and where `git gc` will not
+take it). The workspace must be the repository's top level, since restoring rewrites the
+whole tree. On a resumed run nothing is
+restored while steps replay; the tree is put back once, at the first step that must do
+real work (ADR 0011).
+
+**The code between steps runs again.** Resuming re-executes the pipeline function from the
+top, so anything the driver reads for itself must come from a step — otherwise it either
+changes the fingerprint of every step below it, or hides in a closure and is silently
+discarded on replay. The three that are too easy to get wrong are supplied (ADR 0010):
+
+```ts
+const at = await ctx.now();      // Date.now(), recorded and replayed
+const roll = await ctx.random();
+const id = await ctx.uuid();
+```
 
 ### Storage
 
-`StorageAdapter` is a write-only sink for a run's history: `runStarted`, `stepStarted`,
-`messageAppended`, `stepFinished`, `runFinished`. It never reads, and the SDK never
-deletes anything — retention belongs to whoever implements it. If you already have a
+`StorageAdapter` is a sink for a run's history: `runStarted`, `stepStarted`,
+`messageAppended`, `stepFinished`, `runFinished`. The SDK never deletes anything —
+retention belongs to whoever implements it. Four further methods are optional, and are
+what make a run recoverable rather than merely recorded: `readRun`, `resumable`,
+`heartbeat` and `runSuperseded` (ADR 0009). An adapter implementing all of them is a
+`RunStore`, which is what `pipeline.recover()` asks for. If you already have a
 database, implement the adapter against it rather than running a second store beside it
 (ADR 0003); the default `sqliteStorage()` keeps `runs`, `steps` and `messages` tables in
 a `bun:sqlite` file, which you then query with your own SQL.
@@ -258,6 +324,9 @@ decisions and why:
 | [0006](docs/adr/0006-conservative-cache-keys.md) | Cache keys deliberately over-invalidate |
 | [0007](docs/adr/0007-declared-step-names-for-skipped.md) | Skipped steps come from an optional declared step list |
 | [0008](docs/adr/0008-resume-from-a-run-record.md) | Resume takes the previous run's record, not a read from storage |
+| [0009](docs/adr/0009-durable-runs.md) | A run survives the death of the process that started it |
+| [0010](docs/adr/0010-determinism-in-the-driver.md) | Non-determinism belongs in a step, and the SDK supplies the common cases |
+| [0011](docs/adr/0011-workspace-snapshots.md) | Replay restores Outputs; snapshots restore the workspace |
 
 ## Licence
 

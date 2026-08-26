@@ -446,6 +446,103 @@ function reviewDefaults() {
   };
 }
 
+describe('recovering a kanby-software-factory run', () => {
+  /**
+   * The record a process killed during `claim` leaves behind: everything before it
+   * completed, `claim` itself is still `running`, and nothing after it exists.
+   */
+  const crashedAt = (result: Awaited<ReturnType<ReturnType<typeof createKanbyFactory>['run']>>, name: string) => {
+    const at = result.steps.findIndex((step) => step.name === name);
+    return {
+      ...result,
+      status: 'running' as const,
+      finishedAt: undefined,
+      steps: result.steps.slice(0, at + 1).map((step, index) =>
+        index === at
+          ? { ...step, status: 'running' as const, output: undefined, finishedAt: undefined }
+          : step,
+      ),
+    };
+  };
+
+  const sessions = () =>
+    fake({
+      implement: { summary: 'fixed the formatter' },
+      review: review(),
+    });
+
+  test('a claim that already landed is adopted rather than claimed again', async () => {
+    const first = harness();
+    const original = await createKanbyFactory(first.dependencies).run({
+      input: input('true'),
+      claude: sessions(),
+    });
+    expect(original.status).toBe('completed');
+
+    const second = harness();
+    // The board is the record of what happened: the claim went through before the
+    // process died, so it says the task is ours.
+    second.task.claimedBy = 'factory-agent';
+
+    const recovered = await createKanbyFactory(second.dependencies).run({
+      input: input('true'),
+      claude: sessions(),
+      resumeFrom: crashedAt(original, 'claim'),
+    });
+
+    expect(recovered.status).toBe('completed');
+    const claim = recovered.steps.find((step) => step.name === 'claim')!;
+    expect(claim.recovered).toBe('reconciled');
+    // Asked the board, and did not claim a task it already holds — which `kanby claim`
+    // would have refused anyway, failing the recovery for the wrong reason.
+    expect(second.effects).toContain('get');
+    expect(second.effects).not.toContain('claim');
+    expect(second.effects).toContain('release');
+  });
+
+  test('a claim that never landed is made', async () => {
+    const first = harness();
+    const original = await createKanbyFactory(first.dependencies).run({
+      input: input('true'),
+      claude: sessions(),
+    });
+
+    const second = harness();
+    second.task.claimedBy = null;
+
+    const recovered = await createKanbyFactory(second.dependencies).run({
+      input: input('true'),
+      claude: sessions(),
+      resumeFrom: crashedAt(original, 'claim'),
+    });
+
+    expect(recovered.status).toBe('completed');
+    expect(recovered.steps.find((step) => step.name === 'claim')!.recovered).toBe('rerun');
+    expect(second.effects).toContain('claim');
+  });
+
+  test('a board write interrupted mid-flight is simply repeated', async () => {
+    const first = harness();
+    const original = await createKanbyFactory(first.dependencies).run({
+      input: input('true'),
+      claude: sessions(),
+    });
+
+    const second = harness();
+    second.task.claimedBy = 'factory-agent';
+    const recovered = await createKanbyFactory(second.dependencies).run({
+      input: input('true'),
+      claude: sessions(),
+      resumeFrom: crashedAt(original, 'move-in-progress'),
+    });
+
+    expect(recovered.status).toBe('completed');
+    // A move is a set-operation, so REPEATABLE says do it again rather than stop and ask.
+    expect(recovered.steps.find((step) => step.name === 'move-in-progress')!.recovered).toBe('rerun');
+    expect(second.effects.filter((effect) => effect === 'move:in_progress')).toHaveLength(1);
+  });
+});
+
 function harness(taskOverrides: Partial<KanbyTask> = {}) {
   const effects: string[] = [];
   const outputs: { key: string; title: string; body: string }[] = [];
@@ -458,6 +555,7 @@ function harness(taskOverrides: Partial<KanbyTask> = {}) {
     content: '## Specification\n\nAdd timezone-aware digest formatting.',
     status: 'todo',
     blocked: null,
+    claimedBy: null,
     updatedMs: 123,
     outputKeys: [
       'kanby-software-factory/classification',
@@ -478,6 +576,7 @@ function harness(taskOverrides: Partial<KanbyTask> = {}) {
   };
 
   const kanby = {
+    actor: 'factory-agent',
     async get() {
       effects.push('get');
       return structuredClone(task);

@@ -10,7 +10,8 @@ import type {
   StepRecord,
   StorageAdapter,
 } from './types.ts';
-import { HaltSignal, StepFailedError, isHalt, messageOf } from './errors.ts';
+import type { WorkspaceSnapshots } from './types.ts';
+import { HaltSignal, RunTakenError, StepFailedError, isHalt, messageOf } from './errors.ts';
 import { NEVER_ABORTS, withTimeout } from './timeout.ts';
 
 /** Everything a run needs that is not specific to one step kind. */
@@ -28,7 +29,14 @@ export interface RunnerConfig {
   signal?: AbortSignal;
   /** A previous run whose completed steps this run may replay instead of redoing. */
   resumeFrom?: RunResult;
+  /** Captures the workspace after each step, and restores it on resume (ADR 0011). */
+  snapshots?: WorkspaceSnapshots;
+  /** How often to renew the run's lease. Only used if the adapter can record one. */
+  heartbeatMs?: number;
 }
+
+/** Default lease renewal interval. A supervisor's `staleMs` should be a few of these. */
+export const HEARTBEAT_MS = 15_000;
 
 /**
  * Owns one run: step ordering, records, lifecycle events and the write-through to
@@ -41,15 +49,34 @@ export class Runner {
   private nextIndex = 0;
   /** Completed steps of the run being resumed, by fingerprint. Empty when not resuming. */
   private readonly replayable: Map<string, StepRecord>;
+  /**
+   * Steps the resumed run left `running`: a process died holding them, and whether
+   * their work took effect is unknown (ADR 0009).
+   */
+  private readonly indeterminate: Map<string, StepRecord>;
+  /**
+   * The snapshot this run owes the workspace: the state the last replayed step left
+   * behind, not yet restored because nothing has needed to do real work yet.
+   */
+  private owedSnapshot?: string;
+  /**
+   * The restore currently in progress, if any. A concurrent group's members all reach
+   * `settle()` at once, and every one of them must wait for the tree to be rewritten —
+   * not just whichever got there first.
+   */
+  private restoring?: Promise<void>;
+  private heartbeat?: ReturnType<typeof setInterval>;
   /** The default runner, created once per run and only if a Claude step needs it. */
   claudeRunner?: ClaudeRunner;
 
   constructor(config: RunnerConfig) {
     this.config = config;
+    const prior = (config.resumeFrom?.steps ?? []).filter((step) => step.fingerprint !== undefined);
     this.replayable = new Map(
-      (config.resumeFrom?.steps ?? [])
-        .filter((step) => step.status === 'completed' && step.fingerprint !== undefined)
-        .map((step) => [step.fingerprint!, step]),
+      prior.filter((step) => step.status === 'completed').map((step) => [step.fingerprint!, step]),
+    );
+    this.indeterminate = new Map(
+      prior.filter((step) => step.status === 'running').map((step) => [step.fingerprint!, step]),
     );
     this.record = {
       id: config.runId,
@@ -81,6 +108,54 @@ export class Runner {
     return this.replayable.get(fingerprint);
   }
 
+  /**
+   * The step of the resumed run that was in flight when its process died, if this
+   * exact work is it. Never a step that finished — those replay.
+   */
+  inFlight(fingerprint: string): StepRecord | undefined {
+    return this.indeterminate.get(fingerprint);
+  }
+
+  /**
+   * Carries a replayed step's workspace snapshot forward, and makes it the state the
+   * run owes the workspace before anything does real work again.
+   */
+  noteReplayed(step: StepRecord, prior: StepRecord): void {
+    step.replayed = true;
+    if (prior.snapshot === undefined) return;
+    step.snapshot = prior.snapshot;
+    this.owedSnapshot = prior.snapshot;
+  }
+
+  /**
+   * Puts the workspace back to where the replayed steps left it, if that is still
+   * owed. Called once, at the first moment real work is about to happen, rather than
+   * after every replayed step: the intermediate states are never observed.
+   */
+  async restoreWorkspace(signal: AbortSignal, step: StepRecord): Promise<void> {
+    // A restore already under way is the one to wait for. Clearing `owedSnapshot`
+    // before awaiting would let a sibling step start work on a tree mid-rewrite.
+    if (this.restoring) return this.restoring;
+
+    const snapshot = this.owedSnapshot;
+    if (snapshot === undefined || !this.config.snapshots) return;
+    this.owedSnapshot = undefined;
+    this.restoring = Promise.resolve(
+      this.config.snapshots.restore({
+        workspace: this.config.workspace,
+        runId: this.record.id,
+        step,
+        snapshot,
+        signal,
+      }),
+    );
+    try {
+      await this.restoring;
+    } finally {
+      this.restoring = undefined;
+    }
+  }
+
   /** Fans one of Claude's messages out to storage and to the `message` event, verbatim. */
   async message(step: StepRecord, message: SDKMessage): Promise<void> {
     await this.storage((s) => s.messageAppended(step.id, message));
@@ -90,6 +165,33 @@ export class Runner {
   async start(): Promise<void> {
     await this.storage((s) => s.runStarted(this.record));
     await this.emit((e) => e.runStarted?.(this.record));
+
+    // A run left `running` by a dead process is offered to supervisors until something
+    // takes it over. This run is that something — and the claim has to be exclusive:
+    // two supervisors polling the same stale run would otherwise both finish it, and
+    // duplicate exactly the External effects ADR 0009 exists to protect.
+    const previous = this.config.resumeFrom;
+    if (previous?.status === 'running' && previous.id !== this.record.id) {
+      const adapter = this.config.storage;
+      if (adapter?.runSuperseded) {
+        const won = await adapter.runSuperseded(previous.id, this.record.id);
+        // An adapter that reports nothing cannot arbitrate, and is trusted; one that
+        // says it lost has told us another process is already doing this work.
+        if (won === false) throw new RunTakenError(previous.id);
+      }
+    }
+
+    if (this.config.storage?.heartbeat) {
+      const every = this.config.heartbeatMs ?? HEARTBEAT_MS;
+      this.heartbeat = setInterval(() => {
+        void Promise.resolve(this.config.storage!.heartbeat!(this.record.id, Date.now())).catch(
+          (error) => report(this.config.events, error),
+        );
+      }, every);
+      // A lease must not be the reason a process stays alive.
+      this.heartbeat.unref?.();
+      await this.storage((s) => s.heartbeat!(this.record.id, Date.now()));
+    }
   }
 
   /**
@@ -122,15 +224,32 @@ export class Runner {
   async execute<T>(
     step: StepRecord,
     work: (step: StepRecord, signal: AbortSignal) => Promise<{ value: T; output?: unknown; text?: string }>,
-    options: { timeout?: number } = {},
+    options: { timeout?: number; identify?: () => Promise<string | undefined> } = {},
   ): Promise<T> {
     this.throwIfAborted();
     const name = step.name;
     // Set again here: a step held behind a concurrency limit was claimed earlier than
     // it actually began, and its duration should not count the wait.
     step.startedAt = Date.now();
-    await this.storage((s) => s.stepStarted(step));
-    await this.emit((e) => e.stepStarted?.(step));
+
+    // The fingerprint is settled before the step is announced, so the record written at
+    // the moment work begins says what that work is. A process killed a line later
+    // leaves a row a later run can recognise instead of an anonymous `running` one
+    // (ADR 0009).
+    try {
+      if (options.identify) step.fingerprint = await options.identify();
+    } catch (error) {
+      // The identity could not be computed, so no work will happen — but the step has
+      // already claimed its place, and must not be left looking as though it might be
+      // running somewhere.
+      await this.announce(step);
+      step.status = 'failed';
+      step.error = messageOf(error);
+      await this.finishStep(step);
+      throw new StepFailedError(name, error);
+    }
+
+    await this.announce(step);
 
     try {
       const result = await withTimeout(name, options.timeout, this.config.signal ?? NEVER_ABORTS, (signal) =>
@@ -139,6 +258,9 @@ export class Runner {
       step.status = 'completed';
       if (result.output !== undefined) step.output = result.output;
       if (result.text !== undefined) step.text = result.text;
+      // Before the step is recorded as finished, so a snapshot that cannot be taken
+      // fails the step through the ordinary path rather than after it.
+      await this.captureSnapshot(step);
       await this.finishStep(step);
       return result.value;
     } catch (error) {
@@ -153,6 +275,11 @@ export class Runner {
       await this.finishStep(step);
       throw error instanceof StepFailedError ? error : new StepFailedError(name, error);
     }
+  }
+
+  private async announce(step: StepRecord): Promise<void> {
+    await this.storage((s) => s.stepStarted(step));
+    await this.emit((e) => e.stepStarted?.(step));
   }
 
   /** Records the declared steps a halt stopped the run from reaching. */
@@ -187,6 +314,11 @@ export class Runner {
     | { status: 'halted'; reason: string }
     | { status: 'failed'; error: unknown },
   ): Promise<RunResult> {
+    clearInterval(this.heartbeat);
+
+    // Recorded before the deferred restore below, which may yet fail the run: a run that
+    // halted did halt, and its reason and its skipped steps are the record of that
+    // whatever happens in the epilogue.
     if (outcome.status === 'halted') {
       this.record.haltReason = outcome.reason;
       await this.recordSkipped();
@@ -195,7 +327,26 @@ export class Runner {
     } else {
       this.record.output = outcome.output;
     }
-    this.record.status = outcome.status as RunStatus;
+    let status: RunStatus = outcome.status;
+
+    // A run whose every step replayed never needed the workspace and so never restored
+    // it. The caller is still owed a tree that matches the record it is handed. Only a
+    // replayed step can owe one, so there is always a last step to attribute it to.
+    if (this.owedSnapshot !== undefined) {
+      try {
+        await this.restoreWorkspace(this.config.signal ?? NEVER_ABORTS, this.steps.at(-1)!);
+      } catch (error) {
+        // A run that cannot leave the workspace where it says it did has not completed.
+        if (status === 'failed') {
+          report(this.config.events, error);
+        } else {
+          status = 'failed';
+          this.record.error = messageOf(error);
+          outcome = { status: 'failed', error };
+        }
+      }
+    }
+    this.record.status = status;
     this.record.finishedAt = Date.now();
     this.record.durationMs = this.record.finishedAt - this.record.startedAt;
 
@@ -204,6 +355,21 @@ export class Runner {
     await this.storage((s) => s.runFinished(this.record));
     await this.emit((e) => e.runFinished?.(result));
     return result;
+  }
+
+  /**
+   * Records the workspace as this step left it, so a later run that replays this step
+   * can put the tree back (ADR 0011). A replayed step already carries its predecessor's
+   * snapshot, and a `value` step never touches the workspace.
+   */
+  private async captureSnapshot(step: StepRecord): Promise<void> {
+    if (!this.config.snapshots || step.replayed || step.kind === 'value') return;
+    step.snapshot = await this.config.snapshots.capture({
+      workspace: this.config.workspace,
+      runId: this.record.id,
+      step,
+      signal: this.config.signal ?? NEVER_ABORTS,
+    });
   }
 
   private async finishStep(step: StepRecord): Promise<void> {

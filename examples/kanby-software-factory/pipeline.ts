@@ -17,6 +17,8 @@ export interface KanbyTask {
   content: string;
   status: TaskStatus;
   blocked: { reason: string } | null;
+  /** The agent currently holding the task, if any. What a recovered claim asks about. */
+  claimedBy: string | null;
   updatedMs: number;
   outputKeys: string[];
 }
@@ -47,6 +49,8 @@ export interface GitLabDestination {
 }
 
 export interface KanbyClient {
+  /** The agent identity this client acts as. A recovered run asks whether it already holds a claim. */
+  readonly actor: string;
   get(taskGuid: string, workspace: string, signal: AbortSignal): Promise<KanbyTask>;
   claim(task: KanbyTask, workspace: string, signal: AbortSignal): Promise<void>;
   release(taskGuid: string, workspace: string, signal: AbortSignal): Promise<void>;
@@ -170,6 +174,20 @@ const PREPARATION_KEYS = [
 const READ_ONLY_TOOLS = ['Bash', 'Read', 'Grep', 'Glob'];
 
 /**
+ * What a step does when a crashed run left it in flight and nobody knows whether it
+ * landed (ADR 0009). `ctx.step` defaults to stopping and asking a human, which is right
+ * for an unknown effect and wrong for every effect here but one.
+ *
+ * Every board write below is a set-operation — move, block, release, upsert an output,
+ * overwrite the content — so doing it twice is doing it once. Git and GitLab are the
+ * same by construction: `commit` recognises its own marker on HEAD, `push` pushes a sha
+ * that is already there, and `ensure` finds the merge request before it creates one.
+ * These are properties of the adapters, and this is where the pipeline says it relies
+ * on them.
+ */
+const REPEATABLE = { onCrash: 'rerun' } as const;
+
+/**
  * One pipeline for every open task: it reads where the task is on the board and
  * runs exactly the stages that stage still needs. A `backlog` task goes through
  * intake (classify -> analyze -> brief -> todo) and straight on into delivery; a
@@ -231,6 +249,7 @@ export function createKanbyFactory({
     async run(ctx) {
       const task = await ctx.step('fetch-task', (signal) =>
         kanby.get(ctx.input.taskGuid, ctx.workspace, signal),
+        REPEATABLE,
       );
 
       // Every guard that the fetched snapshot alone can decide runs before the
@@ -244,7 +263,22 @@ export function createKanbyFactory({
         ctx.halt('todo task is missing preparation outputs');
       }
 
-      await ctx.step('claim', (signal) => kanby.claim(task, ctx.workspace, signal));
+      await ctx.step(
+        'claim',
+        async (signal) => {
+          await kanby.claim(task, ctx.workspace, signal);
+          return 'claimed' as const;
+        },
+        {
+          // The one effect here that is not repeatable: `kanby claim` is guarded on the
+          // snapshot it was read from, so repeating it after a crash fails rather than
+          // duplicating. The board already knows the answer, so a recovered run asks.
+          reconcile: async (signal) => {
+            const current = await kanby.get(task.guid, ctx.workspace, signal);
+            return current.claimedBy === kanby.actor ? ('claimed' as const) : undefined;
+          },
+        },
+      );
       const taskLabel = label(task);
 
       // Every stop-and-ask-a-human path is this ritual: record why on the card,
@@ -252,10 +286,15 @@ export function createKanbyFactory({
       // invariant "a stop always releases the claim" holds everywhere.
       const handOffToHuman = (reason: string): Promise<never> =>
         ctx
-          .step('handoff-block', (signal) => kanby.block(task.guid, reason, ctx.workspace, signal))
+          .step(
+            'handoff-block',
+            (signal) => kanby.block(task.guid, reason, ctx.workspace, signal),
+            REPEATABLE,
+          )
           .then(() =>
             ctx.step('handoff-release', (signal) =>
               kanby.release(task.guid, ctx.workspace, signal),
+              REPEATABLE,
             ),
           )
           .then(() => ctx.halt(reason));
@@ -308,6 +347,7 @@ export function createKanbyFactory({
               ctx.workspace,
               signal,
             ),
+            REPEATABLE,
           );
           if (
             classification.output.requiresHumanTriage ||
@@ -362,6 +402,7 @@ export function createKanbyFactory({
               ctx.workspace,
               signal,
             ),
+            REPEATABLE,
           );
           if (!analysis.output.ready) {
             await handOffToHuman(analysis.output.reason);
@@ -371,20 +412,25 @@ export function createKanbyFactory({
           // block stays as the record of what the factory originally proposed.
           await ctx.step('write-brief', (signal) =>
             kanby.update(task.guid, { content: brief }, ctx.workspace, signal),
+            REPEATABLE,
           );
           await ctx.step('move-todo', (signal) =>
             kanby.move(task.guid, 'todo', ctx.workspace, signal),
+            REPEATABLE,
           );
         }
 
         await ctx.step('preflight-git', (signal) =>
           repository.preflight(ctx.workspace, ctx.input.gitlab, signal),
+          REPEATABLE,
         );
         await ctx.step('preflight-gitlab', (signal) =>
           mergeRequests.preflight(ctx.input.gitlab, signal),
+          REPEATABLE,
         );
         await ctx.step('move-in-progress', (signal) =>
           kanby.move(task.guid, 'in_progress', ctx.workspace, signal),
+          REPEATABLE,
         );
 
         let review!: ClaudeHandle<{
@@ -434,10 +480,12 @@ export function createKanbyFactory({
               ctx.workspace,
               signal,
             ),
+            REPEATABLE,
           );
 
           const checked = await ctx.step(`check${suffix}`, (signal) =>
             checks.run(ctx.workspace, ctx.input.testCommand, signal),
+            REPEATABLE,
           );
           await ctx.step(`publish-checks${suffix}`, (signal) =>
             kanby.putOutput(
@@ -458,6 +506,7 @@ export function createKanbyFactory({
               ctx.workspace,
               signal,
             ),
+            REPEATABLE,
           );
 
           if (checked.exitCode !== 0) {
@@ -473,6 +522,7 @@ export function createKanbyFactory({
               ctx.input.maxDiffBytes,
               signal,
             ),
+            REPEATABLE,
           );
           if (staged.truncated) {
             await handOffToHuman(
@@ -517,6 +567,7 @@ export function createKanbyFactory({
               ctx.workspace,
               signal,
             ),
+            REPEATABLE,
           );
 
           const concerns =
@@ -542,9 +593,11 @@ export function createKanbyFactory({
 
         const commit = await ctx.step('commit', (signal) =>
           repository.commit(ctx.workspace, task, ctx.input.gitlab.sourceBranch, signal),
+          REPEATABLE,
         );
         await ctx.step('push', (signal) =>
           repository.push(ctx.workspace, ctx.input.gitlab, commit.sha, signal),
+          REPEATABLE,
         );
 
         // One system of record per step: GitLab owns the merge request, Kanby
@@ -561,14 +614,17 @@ export function createKanbyFactory({
             },
             signal,
           ),
+          REPEATABLE,
         );
         await ctx.step('link-development', (signal) =>
           kanby.linkMergeRequest(task.guid, mergeRequest, ctx.workspace, signal),
+          REPEATABLE,
         );
         await ctx.step('move-in-review', (signal) =>
           kanby.move(task.guid, 'in_review', ctx.workspace, signal),
+          REPEATABLE,
         );
-        await ctx.step('release', (signal) => kanby.release(task.guid, ctx.workspace, signal));
+        await ctx.step('release', (signal) => kanby.release(task.guid, ctx.workspace, signal), REPEATABLE);
       }
 
       async function handOffOnFailure(error: unknown): Promise<void> {
@@ -576,6 +632,7 @@ export function createKanbyFactory({
         try {
           await ctx.step('handoff-block', (signal) =>
             kanby.block(task.guid, reason, ctx.workspace, signal),
+            REPEATABLE,
           );
         } catch {
           // The original failure is the one worth reporting.
@@ -583,6 +640,7 @@ export function createKanbyFactory({
         try {
           await ctx.step('handoff-release', (signal) =>
             kanby.release(task.guid, ctx.workspace, signal),
+            REPEATABLE,
           );
         } catch {
           // Same: a card left claimed is visible on the board, a swallowed cause is not.

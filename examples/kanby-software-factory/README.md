@@ -203,8 +203,11 @@ host, project and merge-request IID.
 
 Conditional claim arguments make the fetched task snapshot part of the claim: if status,
 blocking, content or another task field changed after the fetch, claiming refuses instead
-of continuing from stale intake. `kanby show --json` is expected to include `updated_ms`
-and the task's output source/key pairs; a `todo` task must carry both preparation outputs.
+of continuing from stale intake. `kanby show --json` is expected to include `updated_ms`,
+the task's output source/key pairs, and the agent currently holding it (`claim.agent`);
+a `todo` task must carry both preparation outputs. The claim holder is what makes the
+claim recoverable: it is the one effect here that repeating would fail rather than
+duplicate, so a recovered run asks the board who holds the task instead of guessing.
 
 It is also expected to support **two credential scopes**. Every prompt tells the session
 to read the board with `kanby show`, while every mutation is a recorded pipeline step —
@@ -260,9 +263,27 @@ and `implement` denies `git commit` and `git push` outright. Checks run through
 and commit refuses to run if the workspace changed after the change was staged. A change
 too large to review blocks the task instead of being silently cut.
 
-The example deliberately does not use `resumeFrom`. Replaying a Claude step restores its
-Output, not workspace edits. A stopped run requires the workspace and task to be inspected
-before starting a fresh run. Only one run may operate on a task/workspace at a time.
+A run that stops is picked up, not restarted. Every step declares what it does about a
+crash that left it in flight: the board writes, Git and GitLab are all repeatable —
+`move`, `block`, `release` and `development upsert` are set-operations, `commit`
+recognises its own `Kanby-Task:` marker on HEAD, `push` pushes a sha that is already
+there, and `ensure` finds the merge request before creating one — so they say
+`onCrash: 'rerun'`. The single exception is `claim`, which `kanby` guards on the snapshot
+it was read from and which would therefore *fail* rather than duplicate; it asks the board
+whether the claim is already ours and adopts it if so.
+
+Workspace edits come back from Git rather than from re-running the session that made
+them: the run is given `gitWorkspaceSnapshots()`, so a replayed `implement` step restores
+the tree it produced. `WORKSPACE` must therefore be the checkout's top level — restoring
+rewrites the whole tree, so a directory inside a repository is refused rather than
+silently deleting everything above it. Recovery is one command, and takes only the run's id:
+
+```sh
+bun examples/kanby-software-factory --real --recover <run-id>
+```
+
+Only one run may operate on a task/workspace at a time; a run's heartbeat in
+`.pipelines/runs.sqlite` is what says whether the owner is still alive.
 
 ## Where this differs from the Vercel factory
 

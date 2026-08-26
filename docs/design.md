@@ -82,7 +82,8 @@ Sessions are always fresh: a Claude step never inherits another step's conversat
 | `ctx.claude(...)` | `prompt`, optional `output` schema, `retry`, `model`, `cwd`, `cache`, `timeout` | handle with `.output` (schema) or `.text` (no schema) |
 | `ctx.command(...)` | `command`, `allowFailure`, `cache`, `timeout` | handle with `.stdout`, `.stderr`, `.exitCode`; throws on non-zero unless allowed |
 | `ctx.commands([...])` | a group of command steps, optional `concurrency` | their handles, in declaration order |
-| `ctx.step(name, fn)` | a function, optional `{ timeout }` | whatever the function returns |
+| `ctx.step(name, fn)` | a function, optional `{ timeout, onCrash, reconcile }` | whatever the function returns |
+| `ctx.now()` / `ctx.random()` / `ctx.uuid()` | nothing | a recorded value that replays (ADR 0010) |
 
 Command steps are spawned as `sh -c`, not run through `Bun.$`: a step's `timeout` has to
 be able to kill the process, and `$` exposes no way to cancel one.
@@ -117,17 +118,30 @@ interface StorageAdapter {
   messageAppended(stepId: string, message: SDKMessage): Promise<void>;
   stepFinished(step: StepRecord): Promise<void>;
   runFinished(run: RunRecord): Promise<void>;
+
+  // Optional, and what makes a run recoverable rather than merely recorded (ADR 0009).
+  readRun?(runId: string): Promise<RunResult | undefined>;
+  resumable?(query?: ResumableQuery): Promise<RunRecord[]>;
+  heartbeat?(runId: string, at: number): Promise<void>;
+  runSuperseded?(previous: string, by: string): Promise<void>;
 }
 
 interface CacheAdapter {
   get(key: string): Promise<unknown | undefined>;
   set(key: string, value: unknown): Promise<void>;
 }
+
+interface WorkspaceSnapshots {
+  capture(context: SnapshotContext): Promise<string | undefined>;
+  restore(context: SnapshotContext & { snapshot: string }): Promise<void>;
+}
 ```
 
-Storage is write-only and never deletes; retention belongs to whoever implements it.
-Reads are the consumer's own SQL against their own database. The default adapter is
-`bun:sqlite`, one table for runs, one for steps, one for messages.
+Storage never deletes; retention belongs to whoever implements it. The required half is
+write-only, and reads are the consumer's own SQL against their own database — the optional
+half exists because a run nobody can load cannot be recovered by anyone but the process
+that died holding it. An adapter implementing all four is a `RunStore`. The default
+adapter is `bun:sqlite`, one table for runs, one for steps, one for messages.
 
 Live progress does not come from storage. Because this is a library, the application
 watching a run is the process running it, so it subscribes to `on` events: lifecycle
@@ -153,7 +167,33 @@ again — code steps included, so a resumed run does not repeat their External e
 match is on a step's **fingerprint**, the same value caching uses as its key but computed
 for every step; because it covers the Outputs above a step, a changed Output invalidates
 everything below it. The SDK never reads storage to find the earlier run: you pass the
-record you were given, or rebuild one with your own query. See ADR 0008.
+record you were given, a run id for a store that can read one back, or one you rebuilt
+with your own query. See ADR 0008.
+
+## Recovering a run whose process died
+
+```ts
+for (const run of await storage.resumable({ pipeline: 'implement-issue', staleMs: 60_000 })) {
+  await implementIssue.recover({ runId: run.id, storage });
+}
+```
+
+Three things make this work, and each is an ADR:
+
+- **The journal records intent** (0009). A step's fingerprint is written when it starts,
+  not when it finishes, so a step a crash interrupted is identifiable rather than an
+  anonymous `running` row a later run would silently redo. Such a step is *indeterminate*:
+  a code step stops and says so unless it declares `reconcile` (ask the outside world
+  whether the effect landed) or `onCrash: 'rerun'`. Claude and command steps re-run by
+  default. A run's `heartbeat` is its lease; gone quiet means its work may be taken.
+- **Non-determinism belongs in a step** (0010). Resuming re-executes the driver, so
+  `ctx.now()`, `ctx.random()` and `ctx.uuid()` record their answers as steps. A value the
+  driver reads for itself either re-runs every step below it or is silently discarded on
+  replay, depending on whether it reaches a step's declaration.
+- **Snapshots restore the workspace** (0011). Replay restores Outputs, not the files a
+  session edited. `gitWorkspaceSnapshots()` captures the working tree and the index after
+  each step behind `refs/pipelines/<runId>/<step>`, and a resumed run puts the tree back
+  once, at the first step that must do real work.
 
 ## Testing
 
