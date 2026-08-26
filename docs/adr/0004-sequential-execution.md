@@ -24,10 +24,10 @@ Two properties keep a concurrent group as reproducible as a sequential one:
   it was written rather than the order it finished. `execute` re-stamps `startedAt` when
   a step actually begins, so time spent waiting on the concurrency limit is not counted
   as time spent running.
-- **Members share one upstream snapshot.** ADR 0006 puts every completed upstream Output
+- **Members share one upstream snapshot.** ADR 0006 puts every completed upstream artifact
   into a step's cache key. Read live, that set would depend on which sibling happened to
   finish first, and the same group would key differently from one run to the next.
-  `ctx.commands()` snapshots the upstream Outputs once, before the group starts, and
+  `ctx.commands()` snapshots the upstream artifacts once, before the group starts, and
   keys every member against it.
 
 A group settles fully before it throws. If one member fails, its siblings are still

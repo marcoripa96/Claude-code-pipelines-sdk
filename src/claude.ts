@@ -35,8 +35,8 @@ export interface ClaudeHandle<T = undefined> {
   name: string;
   /** The schema-validated Output. Only present when a schema was declared. */
   output: T;
-  /** Final assistant text. The whole answer when no schema was declared. */
-  text: string;
+  /** The subagent's final message, whether or not it also produced structured Output. */
+  finalMessage: string;
   sessionId?: string;
   cacheHit: boolean;
   step: StepRecord;
@@ -65,7 +65,8 @@ export interface ClaudeRequest {
 }
 
 export interface ClaudeResponse {
-  text: string;
+  /** The subagent's final message from the Agent SDK result. */
+  finalMessage: string;
   /** The value read off the result message's `structured_output`. */
   structuredOutput?: unknown;
   sessionId?: string;
@@ -150,7 +151,7 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps = {}): ClaudeRunner {
     }
 
     return {
-      text: result.result,
+      finalMessage: result.result,
       structuredOutput: result.structured_output,
       sessionId: result.session_id,
       totalCostUsd: result.total_cost_usd,

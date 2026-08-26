@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { fake } from '@marcoripa96/claude-code-pipelines-sdk';
+import { fake, session } from '@marcoripa96/claude-code-pipelines-sdk';
 import { createKanbyFactory } from '../examples/kanby-software-factory/pipeline.ts';
 import type {
   KanbyTask,
@@ -17,7 +17,7 @@ describe('the kanby-software-factory example', () => {
     const claude = fake({
       classify: classification(),
       analyze: analysis(),
-      implement: { summary: 'fixed the formatter' },
+      implement: 'fixed the formatter',
       review: review(),
     });
     const result = await createKanbyFactory(fixture.dependencies).run({
@@ -33,6 +33,11 @@ describe('the kanby-software-factory example', () => {
       'implement',
       'review',
     ]);
+    expect(claude.calls.find((call) => call.stepName === 'review')?.prompt).toBe(
+      '/code-review\n\n' +
+      'Review the implementation of kanby task #42 at commit abc123, using base000 as ' +
+      'the fixed point. Read the prepared brief and recorded checks with: kanby show 019f-task',
+    );
     expect(fixture.effects).toEqual([
       'get',
       'claim',
@@ -61,13 +66,22 @@ describe('the kanby-software-factory example', () => {
       'kanby-software-factory/checks',
       'kanby-software-factory/review',
     ]);
+    expect(fixture.outputs.find((output) => output.title === 'Implementation')?.body).toBe(
+      'fixed the formatter',
+    );
+    expect(fixture.outputs.find((output) => output.title === 'Review')?.body).toStartWith(
+      'Ready for human review.',
+    );
+    const implementation = result.steps.find((step) => step.name === 'implement')!;
+    expect(implementation.finalMessage).toBe('fixed the formatter');
+    expect('output' in implementation).toBe(false);
     expect(fixture.updatedContent).toContain('Add timezone-aware digest formatting.');
   });
 
   test('resumes a prepared todo task at implementation, recording intake as skipped', async () => {
     const fixture = harness();
     const claude = fake({
-      implement: { summary: 'fixed the formatter' },
+      implement: 'fixed the formatter',
       review: review(),
     });
     const result = await createKanbyFactory(fixture.dependencies).run({
@@ -139,7 +153,7 @@ describe('the kanby-software-factory example', () => {
 
   test('records failed checks and blocks before review', async () => {
     const fixture = harness();
-    const claude = fake({ implement: { summary: 'fixed the formatter' } });
+    const claude = fake({ implement: 'fixed the formatter' });
     const result = await createKanbyFactory(fixture.dependencies).run({
       input: input('false'),
       claude,
@@ -165,8 +179,8 @@ describe('the kanby-software-factory example', () => {
   test('revises once and publishes when the second review approves', async () => {
     const fixture = harness();
     const claude = fake({
-      implement: { summary: 'fixed the formatter' },
-      'implement-2': { summary: 'addressed the review concerns' },
+      implement: 'fixed the formatter',
+      'implement-2': 'addressed the review concerns',
       review: review({ concerns: ['no test covers the DST boundary'] }),
       'review-2': review(),
     });
@@ -209,8 +223,8 @@ describe('the kanby-software-factory example', () => {
   test('blocks when the concerns survive every revision round', async () => {
     const fixture = harness();
     const claude = fake({
-      implement: { summary: 'fixed the formatter' },
-      'implement-2': { summary: 'tried to address the concerns' },
+      implement: 'fixed the formatter',
+      'implement-2': 'tried to address the concerns',
       review: review({ concerns: ['no test covers the DST boundary'] }),
       'review-2': review({ completeness: 'partial' }),
     });
@@ -235,7 +249,7 @@ describe('the kanby-software-factory example', () => {
   test('blocks immediately when revisions are disabled', async () => {
     const fixture = harness();
     const claude = fake({
-      implement: { summary: 'fixed the formatter' },
+      implement: 'fixed the formatter',
       review: review({ concerns: ['no test covers the DST boundary'] }),
     });
     const result = await createKanbyFactory(fixture.dependencies).run({
@@ -273,8 +287,8 @@ describe('the kanby-software-factory example', () => {
   test('records the revision round in every step of the loop', async () => {
     const fixture = harness();
     const claude = fake({
-      implement: { summary: 'fixed the formatter' },
-      'implement-2': { summary: 'addressed the review concerns' },
+      implement: 'fixed the formatter',
+      'implement-2': 'addressed the review concerns',
       review: review({ concerns: ['no test covers the DST boundary'] }),
       'review-2': review(),
     });
@@ -307,7 +321,7 @@ describe('the kanby-software-factory example', () => {
     const result = await createKanbyFactory(fixture.dependencies).run({
       input: input('true'),
       claude: fake({
-        implement: { summary: 'fixed the formatter' },
+        implement: 'fixed the formatter',
         review: review({ compatibilityRisk: 'high' }),
       }),
     });
@@ -330,7 +344,7 @@ describe('the kanby-software-factory example', () => {
     const result = await createKanbyFactory(fixture.dependencies).run({
       input: input('true', 1, { maxUnattendedRisk: 'high' }),
       claude: fake({
-        implement: { summary: 'fixed the formatter' },
+        implement: 'fixed the formatter',
         review: review({ compatibilityRisk: 'high' }),
       }),
     });
@@ -357,7 +371,7 @@ describe('the kanby-software-factory example', () => {
     const result = await createKanbyFactory(fixture.dependencies).run({
       input: input('true'),
       claude: fake({
-        implement: { summary: 'implemented' },
+        implement: 'implemented',
         review: review({}),
       }),
     });
@@ -400,7 +414,7 @@ describe('the kanby-software-factory example', () => {
       claude: fake({
         classify: classification({ type: 'bug' }),
         analyze: analysis(),
-        implement: { summary: 'fixed the formatter' },
+        implement: 'fixed the formatter',
         review: review(),
       }),
     });
@@ -459,12 +473,14 @@ function analysisDefaults() {
 }
 
 function review(overrides: Partial<ReturnType<typeof reviewDefaults>> = {}) {
-  return { ...reviewDefaults(), ...overrides };
+  return session({
+    finalMessage: 'Ready for human review.',
+    output: { ...reviewDefaults(), ...overrides },
+  });
 }
 
 function reviewDefaults() {
   return {
-    summary: 'Ready for human review.',
     completeness: 'complete' as 'complete' | 'partial' | 'missing',
     concerns: [] as string[],
     sideEffectRisk: 'low' as RiskLevel,
@@ -494,7 +510,7 @@ describe('recovering a kanby-software-factory run', () => {
 
   const sessions = () =>
     fake({
-      implement: { summary: 'fixed the formatter' },
+      implement: 'fixed the formatter',
       review: review(),
     });
 

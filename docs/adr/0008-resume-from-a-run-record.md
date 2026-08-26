@@ -22,7 +22,8 @@ default sqlite adapter stores everything that takes.
 
 Every step now computes a **fingerprint**, whether or not it is cacheable: the same
 value ADR 0006 already defined as a cache key — the step's declaration, its declared
-input files, the pipeline input, the model, and every upstream Output. A step replays
+input files, the pipeline input, the model, and every upstream step's recorded artifacts.
+A step replays
 only when a *completed* step of the resumed run has the identical fingerprint.
 
 Reusing one value for both is deliberate. Caching and resuming ask the same question —
@@ -30,11 +31,11 @@ Reusing one value for both is deliberate. Caching and resuming ask the same ques
 kept. They are one lookup, tried against the resumed run first because that answer is
 both more specific and free.
 
-Because a fingerprint covers the Outputs above a step, the chain takes care of itself: a
+Because a fingerprint covers the recorded artifacts above a step, the chain takes care of itself: a
 step that genuinely produces something different invalidates everything downstream,
-while a step that re-runs and produces the *same* Output leaves the steps below it
-replayable. What matters is the Output above a step, not whether that step happened to
-re-run.
+while a step that re-runs and produces the *same* artifacts leaves the steps below it
+replayable. What matters is what the upstream step recorded, not whether that step happened
+to re-run. For Claude steps this means both final message and structured Output.
 
 ## Consequences
 

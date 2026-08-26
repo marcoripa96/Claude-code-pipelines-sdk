@@ -9,7 +9,7 @@ learned something the interview could not, this file says so.
 
 Claude edits files, runs tests and greps — that is its job and the pipeline does not
 mediate it. Labels, comments, status changes and pull requests are External effects,
-performed by pipeline code from a step's Output, where they are visible in the run
+performed by pipeline code from recorded step results, where they are visible in the run
 record and testable with a fixture.
 
 ## Defining and running
@@ -51,10 +51,9 @@ export const implementIssue = definePipeline({
       ctx.halt('not viable');            // typed `never`; nothing below runs
     }
 
-    const impl = await ctx.claude({
+    await ctx.claude({
       name: 'implement',
       prompt: `Implement this plan:\n${analysis.output.plan}`,
-      output: z.object({ summary: z.string() }),
     });
 
     await ctx.command({ name: 'test', command: 'bun test' });
@@ -72,14 +71,15 @@ const run = implementIssue.run({
 });
 ```
 
-Context crosses between steps as interpolated Output values or as data a step re-reads.
-Sessions are always fresh: a Claude step never inherits another step's conversation.
+Context crosses between steps as final messages, interpolated Output values, or data a
+step re-reads. Sessions are always fresh: a Claude step never inherits another step's
+conversation.
 
 ## Step kinds
 
 | | declares | returns |
 |---|---|---|
-| `ctx.claude(...)` | `prompt`, optional `output` schema, `retry`, `model`, `cwd`, `cache`, `timeout` | handle with `.output` (schema) or `.text` (no schema) |
+| `ctx.claude(...)` | `prompt`, optional `output` schema, `retry`, `model`, `cwd`, `cache`, `timeout` | handle with `.finalMessage` and optional schema-validated `.output` |
 | `ctx.command(...)` | `command`, `allowFailure`, `cache`, `timeout` | handle with `.stdout`, `.stderr`, `.exitCode`; throws on non-zero unless allowed |
 | `ctx.commands([...])` | a group of command steps, optional `concurrency` | their handles, in declaration order |
 | `ctx.step(name, fn)` | a function, optional `{ timeout, onCrash, reconcile }` | whatever the function returns |
@@ -101,6 +101,8 @@ repeatable is stating a property of itself; a step that disagrees still override
 
 Each `claude()` step is one `query()` against `@anthropic-ai/claude-agent-sdk`:
 
+- `finalMessage` is always the result's final assistant message: the subagent's report for
+  a human, independent of whether the session also has structured Output
 - `outputFormat: { type: 'json_schema', schema: z.toJSONSchema(output) }` when a schema is
   declared, read back off the result's `structured_output`. The `$schema` key Zod emits is
   removed first: the CLI validates the schema with a resolver that does not know the
@@ -114,6 +116,11 @@ Each `claude()` step is one `query()` against `@anthropic-ai/claude-agent-sdk`:
 
 `retry: n` re-runs the whole step on session errors and non-zero exits. The SDK runs its
 own structured-output retries inside that.
+
+Structured Output is control data, not a replacement for the final message. Declare it
+when pipeline code needs stable fields for a branch or External effect; omit it when the
+session only needs to report what it did. Both artifacts are recorded, and both contribute
+to the identity of downstream work.
 
 ## Adapters
 
@@ -156,7 +163,7 @@ events we define, and Claude's `SDKMessage` passed through verbatim.
 ## Caching
 
 Opt-in only, per step, via `cache: { inputs: ['package.json'] }`. The key hashes step
-config, declared input file contents, pipeline input, upstream Outputs and the model
+config, declared input file contents, pipeline input, upstream recorded artifacts and the model
 name — see ADR 0006.
 
 ## Resuming
@@ -171,8 +178,9 @@ if (first.status === 'failed') {
 Every step whose work is unchanged replays the earlier run's result rather than doing it
 again — code steps included, so a resumed run does not repeat their External effects. The
 match is on a step's **fingerprint**, the same value caching uses as its key but computed
-for every step; because it covers the Outputs above a step, a changed Output invalidates
-everything below it. The SDK never reads storage to find the earlier run: you pass the
+for every step; because it covers the recorded artifacts above a step, a changed final
+message or Output invalidates everything below it. The SDK never reads storage to find
+the earlier run: you pass the
 record you were given, a run id for a store that can read one back, or one you rebuilt
 with your own query. See ADR 0008.
 
@@ -198,9 +206,10 @@ Three things make this work, and each is an ADR:
   replay, depending on whether it reaches a step's declaration.
 - **Snapshots restore the workspace** (0011). A run resumed without the adapter that
   captured its snapshots stops with `WorkspaceUnrestorableError`, rather than replaying
-  Outputs onto a tree it never put back. Replay restores Outputs, not the files a
-  session edited. `gitWorkspaceSnapshots()` captures the working tree and the index after
-  each step behind `refs/pipelines/<runId>/<step>`, and a resumed run puts the tree back
+  recorded results onto a tree it never put back. Replay restores final messages, Outputs
+  and other return values, not the files a session edited. `gitWorkspaceSnapshots()`
+  captures the working tree and the index after each step behind
+  `refs/pipelines/<runId>/<step>`, and a resumed run puts the tree back
   once, at the first step that must do real work.
 
 ## Testing

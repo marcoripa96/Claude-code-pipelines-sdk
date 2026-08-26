@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS steps (
   finished_at INTEGER,
   duration_ms INTEGER,
   output TEXT,
+  final_message TEXT,
+  -- Retained so databases created before final_message can be migrated in place.
   text TEXT,
   error TEXT,
   exit_code INTEGER,
@@ -122,6 +124,7 @@ export function sqliteStorage(options: SqliteStorageOptions | string = {}): Sqli
   addColumn(db, 'steps', 'replayed', 'INTEGER');
   addColumn(db, 'steps', 'recovered', 'TEXT');
   addColumn(db, 'steps', 'snapshot', 'TEXT');
+  addColumn(db, 'steps', 'final_message', 'TEXT');
   addColumn(db, 'runs', 'heartbeat_at', 'INTEGER');
   addColumn(db, 'runs', 'superseded_by', 'TEXT');
 
@@ -144,7 +147,7 @@ export function sqliteStorage(options: SqliteStorageOptions | string = {}): Sqli
   `);
   const updateStep = db.query(`
     UPDATE steps SET status = $status, finished_at = $finished_at, duration_ms = $duration_ms,
-      output = $output, text = $text, error = $error, exit_code = $exit_code,
+      output = $output, final_message = $final_message, error = $error, exit_code = $exit_code,
       session_id = $session_id, attempts = $attempts, cache_key = $cache_key, cache_hit = $cache_hit,
       fingerprint = $fingerprint, replayed = $replayed, recovered = $recovered,
       snapshot = $snapshot
@@ -216,7 +219,7 @@ export function sqliteStorage(options: SqliteStorageOptions | string = {}): Sqli
         $finished_at: step.finishedAt ?? null,
         $duration_ms: step.durationMs ?? null,
         $output: json(step.output),
-        $text: step.text ?? null,
+        $final_message: step.finalMessage ?? null,
         $error: step.error ?? null,
         $exit_code: step.exitCode ?? null,
         $session_id: step.sessionId ?? null,
@@ -305,6 +308,8 @@ interface StepRow {
   finished_at: number | null;
   duration_ms: number | null;
   output: string | null;
+  final_message: string | null;
+  /** Legacy column, read only so existing run histories remain usable. */
   text: string | null;
   error: string | null;
   exit_code: number | null;
@@ -354,7 +359,7 @@ function stepRecord(row: StepRow): StepRecord {
     ...defined({
       finishedAt: row.finished_at,
       durationMs: row.duration_ms,
-      text: row.text,
+      finalMessage: row.final_message ?? row.text,
       error: row.error,
       exitCode: row.exit_code,
       sessionId: row.session_id,

@@ -16,17 +16,18 @@ in_review     a pushed change and merge request await a human
 done          human-approved completion
 ```
 
-The example deliberately returns no changed files, test boolean, model approval or
-delivery summary. Git owns the diff, command steps own exit codes, and Kanby owns the
-task-facing outputs, prepared brief, blocking condition, development links and status
-trace.
+The example deliberately returns no changed files, test boolean or model approval. The
+implementer's final message is its human-facing report, while Git owns the diff, command
+steps own exit codes, and Kanby owns the task-facing outputs, prepared brief, blocking
+condition, development links and status trace.
 
 ## What a step is
 
 Step boundaries are the one design decision this example is really about, so it is worth
 stating precisely rather than by feel. A step is the SDK's atom in four senses at once:
 
-1. **The record unit** — one `StepRecord`: name, status, timing, Output, error.
+1. **The record unit** — one `StepRecord`: name, status, timing, final message, Output,
+   error.
 2. **The failure unit** — one retry envelope and one timeout envelope. Everything inside
    a step fails together and is re-attempted together.
 3. **The replay unit** — one fingerprint. A resumed run replays or redoes a step whole;
@@ -55,6 +56,12 @@ definition rather than standing beside it:
   feeds `claim`'s conditional arguments); the `git status` inside preflight does not.
 - **A session and the recording of its decision are different steps**, because a failed
   board write must not re-run the session.
+
+A Claude step records two different artifacts. Its **final message** is the subagent's
+human-facing report. Its optional structured **Output** is control data for pipeline code.
+Classification, analysis and review declare Output because code branches on their fields;
+implementation does not, because its report needs no machine decision and Git is the
+authority for what changed.
 
 The pipeline's rhythm reads: **decide → record → gate**, with column moves marking the
 chapter boundaries.
@@ -91,7 +98,7 @@ both:
   verify what was pushed: right branch, clean tree, a real commit, origin at it
   run checks in an isolated sandbox -> attach Checks output
     -> failure: handoff, halt in in_progress
-  review the commit range, reading the task and `git diff <base> <sha>`
+  review through `/code-review`
     -> complete: leave the loop
     -> concerns and revisions remain: revise -> implement again
     -> concerns and revisions exhausted: handoff, halt in in_progress
@@ -262,13 +269,13 @@ that every fetch/push URL for `origin`, the current branch and the configured Gi
 project agree before implementation starts, and GitBeaker verifies project and
 target-branch access, so a misdirected push is caught early.
 
-Prompts are short job statements, not documents: each names the task and points at the
-sources — `kanby show` for board truth (the brief and recorded checks live there),
-`git diff <base> <sha>` for the change — and the model chooses its own path from there.
-Sessions get the full tool set; the prompt is the guideline, and what actually holds is
-verified afterwards rather than forbidden in advance. Tool allow-lists were tried and
-removed: a list containing `Bash` restricts nothing, so it bought a false sense of a
-guarantee that the checks below already provide for real.
+Prompts are short job statements, not documents. The review step delegates its procedure
+to `/code-review`, then supplies only the task, reviewed commit, fixed point and source of
+the prepared brief and checks; the pipeline's schema declares the verdict it needs for
+control flow. Sessions get the full tool set; the prompt is the guideline, and what
+actually holds is verified afterwards rather than forbidden in advance. Tool allow-lists
+were tried and removed: a list containing `Bash` restricts nothing, so it bought a false
+sense of a guarantee that the checks below already provide for real.
 
 What holds without the model's cooperation: the implementing session commits and pushes,
 and `verify-commit` reads back what it left — right branch, clean tree, at least one

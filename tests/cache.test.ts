@@ -76,7 +76,11 @@ describe('cache keys', () => {
 describe('per-step caching', () => {
   const claudeFor = (calls: { n: number }): ClaudeRunner => async () => {
     calls.n++;
-    return { text: 'answer', structuredOutput: { viable: true }, sessionId: `s${calls.n}` };
+    return {
+      finalMessage: 'answer',
+      structuredOutput: { viable: true },
+      sessionId: `s${calls.n}`,
+    };
   };
 
   const pipeline = definePipeline({
@@ -185,6 +189,43 @@ describe('per-step caching', () => {
     expect(second.output).toBe('1');
     expect(second.steps[0]!.cacheHit).toBe(true);
     expect(await Bun.file(marker).text()).toBe('tick\n');
+  });
+
+  test('reads the text field from an old cache entry whose key is still valid', async () => {
+    const cache = memoryCache();
+    const legacyKey = await computeCacheKey({
+      pipeline: 'legacy-cache',
+      stepName: 'summarise',
+      kind: 'claude',
+      config: { prompt: 'Summarise.' },
+      inputs: [],
+      workspace,
+      pipelineInput: undefined,
+      upstream: [],
+      model: 'default',
+    });
+    cache.store.set(legacyKey, {
+      output: undefined,
+      text: 'legacy cached report',
+      sessionId: 'legacy-session',
+    });
+    const claude: ClaudeRunner = async () => {
+      throw new Error('legacy cache was not found');
+    };
+    const pipeline = definePipeline({
+      name: 'legacy-cache',
+      async run(ctx) {
+        return await ctx.claude({ name: 'summarise', prompt: 'Summarise.', cache: {} });
+      },
+    });
+
+    const result = await pipeline.run({ input: undefined, workspace, cache, claude });
+
+    expect(result.status).toBe('completed');
+    expect(result.output?.finalMessage).toBe('legacy cached report');
+    expect(result.output?.sessionId).toBe('legacy-session');
+    expect(result.steps[0]!.cacheHit).toBe(true);
+    expect(cache.store.size).toBe(1);
   });
 
   test('sqliteCache reads back what it wrote', async () => {

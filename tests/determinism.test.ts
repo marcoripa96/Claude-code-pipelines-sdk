@@ -52,7 +52,7 @@ describe('recorded values', () => {
           const said = await ctx.claude({ name: 'think', prompt: 'think' });
           await ctx.step('use', () => {
             ran.push('use');
-            return `${said.text}@${at}`;
+            return `${said.finalMessage}@${at}`;
           });
         },
       });

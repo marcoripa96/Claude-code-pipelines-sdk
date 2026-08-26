@@ -10,7 +10,7 @@ import type { ClaudeRunner, StorageAdapter } from '../src/index.ts';
 const claude: ClaudeRunner = async (_request, onMessage) => {
   onMessage({ type: 'assistant', text: 'thinking' } as never);
   onMessage({ type: 'result', subtype: 'success' } as never);
-  return { text: 'done', structuredOutput: { ok: true }, sessionId: 'sess-1' };
+  return { finalMessage: 'done', structuredOutput: { ok: true }, sessionId: 'sess-1' };
 };
 
 describe('sqlite storage adapter', () => {
@@ -61,7 +61,7 @@ describe('sqlite storage adapter', () => {
     expect(steps.every((s) => s.status === 'completed')).toBe(true);
     expect(steps[0]!.session_id).toBe('sess-1');
     expect(JSON.parse(steps[0]!.output as string)).toEqual({ ok: true });
-    expect(steps[0]!.text).toBe('done');
+    expect(steps[0]!.final_message).toBe('done');
     expect(steps[1]!.exit_code).toBe(0);
     expect(JSON.parse(steps[2]!.output as string)).toEqual({ seen: true });
 

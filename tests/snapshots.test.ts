@@ -158,7 +158,7 @@ describe('a resumed run continues against the workspace it left behind', () => {
           return await ctx.step('read-back', async () => {
             if (shouldFail) throw new Error('not yet');
             // Only passes if the file the replayed step wrote is actually there.
-            return `${session.text}:${await Bun.file(join(ctx.workspace, 'artifact.txt')).text()}`;
+            return `${session.finalMessage}:${await Bun.file(join(ctx.workspace, 'artifact.txt')).text()}`;
           });
         },
       });

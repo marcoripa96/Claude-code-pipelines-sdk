@@ -493,7 +493,7 @@ describe('reading a run back', () => {
       original.steps.map((s) => [s.name, s.status, s.kind]),
     );
     expect(read.steps[0]!.output).toEqual({ nested: [1, 'two', null] });
-    expect(read.steps[1]!.text).toBe('an answer');
+    expect(read.steps[1]!.finalMessage).toBe('an answer');
     expect(read.steps.map((s) => s.fingerprint)).toEqual(original.steps.map((s) => s.fingerprint));
     // The skipped step a halt recorded survives the round trip too.
     expect(read.steps.find((s) => s.name === 'never')!.status).toBe('skipped');

@@ -1,4 +1,4 @@
-import type { Runner } from './runner.ts';
+import type { Runner, StepIdentity } from './runner.ts';
 import type {
   CacheOptions,
   CodeStepOptions,
@@ -155,7 +155,11 @@ export class RunContext<I = unknown> {
 
       const settled = await this.settle(
         step,
-        (prior) => ({ output: prior.output, text: prior.text ?? '', sessionId: prior.sessionId }),
+        (prior) => ({
+          output: prior.output,
+          finalMessage: prior.finalMessage ?? legacyFinalMessage(prior) ?? '',
+          sessionId: prior.sessionId,
+        }),
         // A session acts on the workspace, which snapshots restore, so repeating one
         // costs tokens rather than correctness.
         { onCrash: this.onCrash(options.onCrash, 'rerun'), signal },
@@ -163,12 +167,18 @@ export class RunContext<I = unknown> {
       );
 
       if (settled) {
-        const stored = settled.value as { output?: unknown; text: string; sessionId?: string };
+        const stored = settled.value as {
+          output?: unknown;
+          finalMessage?: string;
+          /** Cache entries written before finalMessage was introduced. */
+          text?: string;
+          sessionId?: string;
+        };
         if (settled.from === 'cache') step.cacheHit = true;
         const handle: ClaudeHandle<unknown> = {
           name: options.name,
           output: stored.output,
-          text: stored.text,
+          finalMessage: stored.finalMessage ?? stored.text ?? '',
           sessionId: stored.sessionId,
           cacheHit: step.cacheHit === true,
           step,
@@ -243,7 +253,7 @@ export class RunContext<I = unknown> {
         return {
           name: options.name,
           output,
-          text: response.text,
+          finalMessage: response.finalMessage,
           sessionId: response.sessionId,
           cacheHit: false,
           step,
@@ -284,7 +294,10 @@ export class RunContext<I = unknown> {
     list: readonly CommandStepOptions[],
     options: { concurrency?: number } = {},
   ): Promise<CommandHandle[]> {
-    const upstream = this.runner.upstreamOutputs();
+    const upstream = {
+      current: this.runner.upstreamOutputs(),
+      legacy: this.runner.legacyUpstreamOutputs(),
+    };
     // Places are claimed for all of them first, so the run records the group in the
     // order it was written rather than the order it finished.
     const steps = list.map((item) => this.runner.beginStep(commandStepName(item), 'command'));
@@ -305,7 +318,10 @@ export class RunContext<I = unknown> {
   private commandStep(
     options: CommandStepOptions,
     step: StepRecord,
-    upstream?: { name: string; output: unknown }[],
+    upstream?: {
+      current: { name: string; output: unknown }[];
+      legacy: { name: string; output: unknown }[];
+    },
   ): Promise<CommandHandle> {
     const name = step.name;
     const cwd = options.cwd ?? this.workspace;
@@ -350,9 +366,15 @@ export class RunContext<I = unknown> {
     kind: string,
     cache: CacheOptions | undefined,
     config: Record<string, unknown>,
-    upstream: { name: string; output: unknown }[] = this.runner.upstreamOutputs(),
-  ): Promise<string> {
-    return computeCacheKey({
+    upstream: {
+      current: { name: string; output: unknown }[];
+      legacy: { name: string; output: unknown }[];
+    } = {
+      current: this.runner.upstreamOutputs(),
+      legacy: this.runner.legacyUpstreamOutputs(),
+    },
+  ): Promise<StepIdentity> {
+    const common = {
       pipeline: this.runner.config.pipeline,
       stepName,
       kind,
@@ -360,9 +382,13 @@ export class RunContext<I = unknown> {
       inputs: cache?.inputs ?? [],
       workspace: this.workspace,
       pipelineInput: this.input,
-      upstream,
       model: this.runner.config.model ?? 'default',
-    });
+    };
+    const [fingerprint, legacyFingerprint] = await Promise.all([
+      computeCacheKey({ ...common, upstream: upstream.current }),
+      computeCacheKey({ ...common, upstream: upstream.legacy }),
+    ]);
+    return { fingerprint, legacyFingerprint, upstream: upstream.current };
   }
 
   /**
@@ -381,6 +407,8 @@ export class RunContext<I = unknown> {
     record.cacheKey = key;
     record.cacheHit = false;
     return {
+      // Unlike a run record, a cache entry has no upstream records with which to prove
+      // that artifacts omitted by an old key are unchanged. A miss is safer than stale work.
       get: async () => adapter.get(key),
       set: async (value) => {
         await adapter.set(key, value);
@@ -425,15 +453,13 @@ export class RunContext<I = unknown> {
     },
     cache?: CacheSlot,
   ): Promise<Settled | undefined> {
-    const fingerprint = record.fingerprint!;
-
-    const prior = this.runner.replay(fingerprint);
+    const prior = this.runner.replay(record);
     if (prior) {
       this.runner.noteReplayed(record, prior);
       return { value: fromReplay(prior), from: 'replay' };
     }
 
-    const inFlight = this.runner.inFlight(fingerprint);
+    const inFlight = this.runner.inFlight(record);
     if (inFlight) {
       // Whatever happens next touches the workspace, so it must see the tree the
       // crashed run was working against, not the one this process started with.
@@ -474,8 +500,21 @@ export class RunContext<I = unknown> {
 }
 
 /** What a Claude step produced, as the runner records it — cached or freshly run alike. */
-function produced(handle: ClaudeHandle<unknown>): { output: unknown; text: string; sessionId?: string } {
-  return { output: handle.output, text: handle.text, sessionId: handle.sessionId };
+function produced(handle: ClaudeHandle<unknown>): {
+  output: unknown;
+  finalMessage: string;
+  sessionId?: string;
+} {
+  return {
+    output: handle.output,
+    finalMessage: handle.finalMessage,
+    sessionId: handle.sessionId,
+  };
+}
+
+/** Reads run records created before `StepRecord.finalMessage` replaced `text`. */
+function legacyFinalMessage(step: StepRecord): string | undefined {
+  return (step as StepRecord & { text?: string }).text;
 }
 
 /** A command step's recorded name: what it declared, else the command itself. */

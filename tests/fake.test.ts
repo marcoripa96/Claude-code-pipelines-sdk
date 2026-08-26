@@ -97,11 +97,11 @@ describe('fake()', () => {
     expect(result.error).toContain('no fixture for step "analyze"');
   });
 
-  test('a string fixture is the final text of a step with no schema', async () => {
+  test('a string fixture is the final message of a step with no schema', async () => {
     const prose = definePipeline({
       name: 'prose',
       async run(ctx) {
-        return (await ctx.claude({ name: 'summarise', prompt: 'Summarise.' })).text;
+        return (await ctx.claude({ name: 'summarise', prompt: 'Summarise.' })).finalMessage;
       },
     });
 
@@ -109,7 +109,7 @@ describe('fake()', () => {
     expect(result.output).toBe('a summary');
   });
 
-  test('session() sets text, session id and passed-through messages', async () => {
+  test('session() sets the final message, session id and passed-through messages', async () => {
     const seen: unknown[] = [];
     const prose = definePipeline({
       name: 'prose',
@@ -122,7 +122,7 @@ describe('fake()', () => {
       input: undefined,
       claude: fake({
         summarise: session({
-          text: 'a summary',
+          finalMessage: 'a summary',
           sessionId: 'abc',
           messages: [{ type: 'assistant' } as never],
         }),
@@ -131,7 +131,7 @@ describe('fake()', () => {
     });
 
     expect(result.steps[0]!.sessionId).toBe('abc');
-    expect(result.steps[0]!.text).toBe('a summary');
+    expect(result.steps[0]!.finalMessage).toBe('a summary');
     expect(seen).toEqual([{ type: 'assistant' }]);
   });
 
@@ -139,7 +139,7 @@ describe('fake()', () => {
     const prose = definePipeline({
       name: 'prose',
       async run(ctx) {
-        return (await ctx.claude({ name: 'echo', prompt: 'the prompt' })).text;
+        return (await ctx.claude({ name: 'echo', prompt: 'the prompt' })).finalMessage;
       },
     });
 

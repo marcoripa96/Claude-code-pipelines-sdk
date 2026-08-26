@@ -8,9 +8,9 @@ supplies values that code branches on.
 >
 > Editing files, running tests and grepping are Claude's own business, and the
 > pipeline does not mediate them. Labels, comments, status changes and pull requests
-> are External effects: pipeline code performs them, from a step's Output, where they
-> are visible in the run record and testable with a fixture. Claude never selects what
-> runs next.
+> are External effects: pipeline code performs them from recorded step results, where
+> they are visible in the run record and testable with a fixture. Claude never selects
+> what runs next.
 
 ## Install
 
@@ -80,15 +80,16 @@ bun run examples/kanby-software-factory/index.ts --real
 
 | | declares | returns |
 |---|---|---|
-| `ctx.claude(...)` | `prompt`, optional `output` schema, `retry`, `model`, `cwd`, `cache`, `timeout` | handle with `.output` (schema) or `.text` (no schema) |
+| `ctx.claude(...)` | `prompt`, optional `output` schema, `retry`, `model`, `cwd`, `cache`, `timeout` | handle with `.finalMessage` and optional schema-validated `.output` |
 | `ctx.command(...)` | `command`, `allowFailure`, `cwd`, `env`, `cache`, `timeout` | handle with `.stdout`, `.stderr`, `.exitCode`; throws on a non-zero exit unless allowed |
 | `ctx.commands([...])` | a group of command steps, optional `concurrency` | their handles, in the order declared |
 | `ctx.step(name, fn)` | a function, optional `{ timeout }` | whatever the function returns |
 | `ctx.halt(reason)` | a reason | `never` — the run ends, successfully |
 
 Steps execute sequentially, except a group handed to `ctx.commands()` (ADR 0004).
-Context crosses between steps as interpolated Output values or as data a step re-reads;
-a Claude session is always fresh and never inherits another step's conversation.
+Context crosses between steps as final messages, interpolated Output values, or data a
+step re-reads; a Claude session is always fresh and never inherits another step's
+conversation.
 
 ### Deadlines
 
@@ -122,10 +123,11 @@ its siblings still finish and are recorded before the group throws.
 
 ### Claude steps
 
-Each is one `query()` against `@anthropic-ai/claude-agent-sdk`. Declaring `output`
-turns the answer into a schema-validated Output using the SDK's own `outputFormat`
-(ADR 0002); the SDK's structured-output retries happen inside a step, and `retry: n`
-adds `n` further whole-session attempts around them.
+Each is one `query()` against `@anthropic-ai/claude-agent-sdk`. Every session returns a
+final message: the subagent's human-facing report. Declaring `output` additionally asks
+for schema-validated control data using the SDK's own `outputFormat` (ADR 0002). The SDK's
+structured-output retries happen inside a step, and `retry: n` adds `n` further
+whole-session attempts around them.
 
 The defaults are `permissionMode: 'bypassPermissions'` (an unattended pipeline that
 stops to ask a human is a hang, not a safeguard), `skills: 'all'` so the prompt can name
@@ -175,9 +177,10 @@ which is the point: a resumed run must not post the comment twice.
 
 A step replays when its **fingerprint** matches a completed step of the earlier run —
 the same value ADR 0006 defines as a cache key, computed for every step. Because it
-covers the Outputs above a step, a step that genuinely produces something different
-invalidates everything below it, while one that re-runs and produces the same Output
-leaves them replayable.
+covers the recorded artifacts above a step, a step that genuinely produces something
+different invalidates everything below it, while one that re-runs and produces the same
+artifacts leaves them replayable. A Claude step contributes both its final message and
+its optional structured Output.
 
 Pass the `RunResult` you were given, or a run id for a store that can read one back.
 
@@ -232,9 +235,9 @@ definePipeline({
 A step that declares its own `onCrash` still wins, and a step with a `reconcile` never
 consults either: asking is always better than assuming.
 
-**Replay restores Outputs, not files.** A replayed session hands back the Output it
-produced, not the forty files it edited. Give the run a `WorkspaceSnapshots` adapter and
-the tree comes back too:
+**Replay restores recorded results, not files.** A replayed session hands back its final
+message and optional Output, not the forty files it edited. Give the run a
+`WorkspaceSnapshots` adapter and the tree comes back too:
 
 ```ts
 await pipeline.run({ input, snapshots: gitWorkspaceSnapshots() });
@@ -249,7 +252,7 @@ restored while steps replay; the tree is put back once, at the first step that m
 real work (ADR 0011).
 
 Resume a snapshotted run *without* the adapter and it stops with
-`WorkspaceUnrestorableError` rather than replaying Outputs onto a tree it never put back.
+`WorkspaceUnrestorableError` rather than replaying recorded results onto a tree it never put back.
 Silently continuing would hand every step below a workspace that does not match the
 record it was just given.
 
@@ -294,7 +297,7 @@ await ctx.claude({ name: 'analyze', prompt, output, cache: { inputs: ['package.j
 
 `inputs` takes file paths, glob patterns, or a directory, which is read as everything
 beneath it. The key hashes the step's configuration, the contents of its declared input
-files, the pipeline's input, every upstream step's Output, and the model name. That deliberately
+files, the pipeline's input, every upstream step's recorded artifacts, and the model name. That deliberately
 over-invalidates (ADR 0006): re-running costs a session, while a silently stale hit costs
 an afternoon. `memoryCache()` and `sqliteCache()` are included; `CacheAdapter` is two
 methods if you want your own.
@@ -311,7 +314,7 @@ const result = await triage.run({
   claude: fake({
     classify: { type: 'chore', labels: ['chore'] },   // a plain object is the Output
     analyze: [new Error('session died'), { viable: true }],  // one entry per attempt
-    summarise: 'plain text, for a step with no schema',
+    summarise: 'a final message, for a step with no schema',
   }),
 });
 
@@ -320,7 +323,7 @@ expect(result.steps.find((s) => s.name === 'implement')?.status).toBe('skipped')
 ```
 
 Fixtures still go through the step's Output schema, so one that would not have validated
-fails the step exactly as a real answer would. `session({ output, text, sessionId,
+fails the step exactly as a real answer would. `session({ output, finalMessage, sessionId,
 messages })` spells out a stand-in session when the Output alone is not enough, and the
 returned runner records every request on `.calls`.
 
@@ -346,7 +349,7 @@ decisions and why:
 | [0008](docs/adr/0008-resume-from-a-run-record.md) | Resume takes the previous run's record, not a read from storage |
 | [0009](docs/adr/0009-durable-runs.md) | A run survives the death of the process that started it |
 | [0010](docs/adr/0010-determinism-in-the-driver.md) | Non-determinism belongs in a step, and the SDK supplies the common cases |
-| [0011](docs/adr/0011-workspace-snapshots.md) | Replay restores Outputs; snapshots restore the workspace |
+| [0011](docs/adr/0011-workspace-snapshots.md) | Replay restores results; snapshots restore the workspace |
 
 ## Licence
 

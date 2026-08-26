@@ -47,8 +47,8 @@ export function describe(error: unknown): string {
 
 export function mergeRequestDescription(
   task: KanbyTask,
+  finalMessage: string,
   output: {
-    summary: string;
     sideEffectRisk: RiskLevel;
     performanceRisk: RiskLevel;
     compatibilityRisk: RiskLevel;
@@ -57,7 +57,7 @@ export function mergeRequestDescription(
 ): string {
   const peak = peakRisk(output);
   return [
-    output.summary,
+    finalMessage,
     '',
     `**Suggested review depth:** ${reviewDepth(peak.level)} — ` +
     `${peak.dimension.toLowerCase()} risk is ${peak.level}.`,
@@ -137,19 +137,21 @@ export function formatCommandOutput(command: string, exitCode: number, stdout: s
   ].join('\n');
 }
 
-export function formatReview(output: {
-  summary: string;
-  completeness: string;
-  concerns: string[];
-  sideEffectRisk: RiskLevel;
-  performanceRisk: RiskLevel;
-  compatibilityRisk: RiskLevel;
-}): string {
+export function formatReview(
+  finalMessage: string,
+  output: {
+    completeness: string;
+    concerns: string[];
+    sideEffectRisk: RiskLevel;
+    performanceRisk: RiskLevel;
+    compatibilityRisk: RiskLevel;
+  },
+): string {
   const concerns = output.concerns.length > 0
     ? ['## Concerns', '', ...output.concerns.map((concern) => `- ${concern}`), '']
     : [];
   return [
-    output.summary,
+    finalMessage,
     '',
     `**Completeness:** ${output.completeness}`,
     `**Side-effect risk:** ${output.sideEffectRisk}`,

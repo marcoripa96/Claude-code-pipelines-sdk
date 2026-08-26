@@ -1,5 +1,6 @@
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { ClaudeRunner } from './claude.ts';
+import { stableStringify } from './cache.ts';
 import type {
   CacheAdapter,
   CrashPolicy,
@@ -68,8 +69,15 @@ export interface StepWork<T> {
   /** What the step returns to pipeline code. */
   value: T;
   output?: unknown;
-  text?: string;
+  finalMessage?: string;
   sessionId?: string;
+}
+
+/** Current identity plus the pre-finalMessage identity used to adopt old records safely. */
+export interface StepIdentity {
+  fingerprint: string;
+  legacyFingerprint: string;
+  upstream: { name: string; output: unknown }[];
 }
 
 /**
@@ -88,6 +96,10 @@ export class Runner {
    * their work took effect is unknown (ADR 0009).
    */
   private readonly indeterminate: Map<string, StepRecord>;
+  /** Compatibility candidate computed for this run, never written to a new record. */
+  private readonly legacyFingerprints = new Map<string, string>();
+  /** Current upstream artifacts captured when a step's fingerprint was computed. */
+  private readonly fingerprintUpstreams = new Map<string, { name: string; output: unknown }[]>();
   /**
    * The snapshot this run owes the workspace: the state the last replayed step left
    * behind, not yet restored because nothing has needed to do real work yet.
@@ -123,11 +135,25 @@ export class Runner {
     };
   }
 
-  /** Outputs of every step completed so far, in order. Feeds cache keys (ADR 0006). */
+  /**
+   * Recorded artifacts of every completed step, in order. Feeds fingerprints and cache
+   * keys (ADR 0006). A Claude step contributes both artifacts because pipeline code may
+   * consume its final message even when the session also declared structured Output.
+   */
   upstreamOutputs(): { name: string; output: unknown }[] {
     return this.steps
       .filter((s) => s.status === 'completed')
-      .map((s) => ({ name: s.name, output: s.output ?? s.text ?? null }));
+      .map(recordedArtifacts);
+  }
+
+  /** The upstream serialization used before final messages became first-class artifacts. */
+  legacyUpstreamOutputs(): { name: string; output: unknown }[] {
+    return this.steps
+      .filter((step) => step.status === 'completed')
+      .map((step) => ({
+        name: step.name,
+        output: step.output ?? step.finalMessage ?? null,
+      }));
   }
 
   /**
@@ -135,19 +161,48 @@ export class Runner {
    * is one.
    *
    * Matching on the fingerprint is what makes resume safe to chain: a step's
-   * fingerprint covers every upstream Output, so a step that genuinely re-runs and
-   * produces something different breaks the match for everything after it.
+   * fingerprint covers every upstream recorded artifact, so a step that genuinely
+   * re-runs and produces something different breaks the match for everything after it.
    */
-  replay(fingerprint: string): StepRecord | undefined {
-    return this.replayable.get(fingerprint);
+  replay(record: StepRecord): StepRecord | undefined {
+    const current = this.replayable.get(record.fingerprint!);
+    if (current) return current;
+    const legacy = this.legacyFingerprint(record);
+    if (legacy === undefined) return undefined;
+    const prior = this.replayable.get(legacy);
+    return prior && this.legacyArtifactsMatch(record, prior) ? prior : undefined;
   }
 
   /**
    * The step of the resumed run that was in flight when its process died, if this
    * exact work is it. Never a step that finished — those replay.
    */
-  inFlight(fingerprint: string): StepRecord | undefined {
-    return this.indeterminate.get(fingerprint);
+  inFlight(record: StepRecord): StepRecord | undefined {
+    const current = this.indeterminate.get(record.fingerprint!);
+    if (current) return current;
+    const legacy = this.legacyFingerprint(record);
+    if (legacy === undefined) return undefined;
+    const prior = this.indeterminate.get(legacy);
+    return prior && this.legacyArtifactsMatch(record, prior) ? prior : undefined;
+  }
+
+  /** The old-format candidate for a step currently being identified. */
+  legacyFingerprint(step: StepRecord): string | undefined {
+    return this.legacyFingerprints.get(step.id);
+  }
+
+  /**
+   * An old fingerprint did not cover Claude final messages or Output presence. Adopt it
+   * only when the old run record proves those omitted artifacts are unchanged.
+   */
+  private legacyArtifactsMatch(record: StepRecord, prior: StepRecord): boolean {
+    const current = this.fingerprintUpstreams.get(record.id) ?? [];
+    const previous = (this.config.resumeFrom?.steps ?? [])
+      .filter((step) => step.status === 'completed' && step.index >= 0 && step.index < prior.index)
+      .sort((a, b) => a.index - b.index)
+      .slice(0, current.length)
+      .map(recordedArtifacts);
+    return stableStringify(current) === stableStringify(previous);
   }
 
   /**
@@ -264,7 +319,7 @@ export class Runner {
   async execute<T>(
     step: StepRecord,
     work: (step: StepRecord, signal: AbortSignal) => Promise<StepWork<T>>,
-    options: { timeout?: number; identify?: () => Promise<string | undefined> } = {},
+    options: { timeout?: number; identify?: () => Promise<StepIdentity | undefined> } = {},
   ): Promise<T> {
     this.throwIfAborted();
     const name = step.name;
@@ -277,7 +332,14 @@ export class Runner {
     // leaves a row a later run can recognise instead of an anonymous `running` one
     // (ADR 0009).
     try {
-      if (options.identify) step.fingerprint = await options.identify();
+      if (options.identify) {
+        const identity = await options.identify();
+        step.fingerprint = identity?.fingerprint;
+        if (identity) {
+          this.legacyFingerprints.set(step.id, identity.legacyFingerprint);
+          this.fingerprintUpstreams.set(step.id, identity.upstream);
+        }
+      }
     } catch (error) {
       // The identity could not be computed, so no work will happen — but the step has
       // already claimed its place, and must not be left looking as though it might be
@@ -297,7 +359,7 @@ export class Runner {
       );
       step.status = 'completed';
       if (result.output !== undefined) step.output = result.output;
-      if (result.text !== undefined) step.text = result.text;
+      if (result.finalMessage !== undefined) step.finalMessage = result.finalMessage;
       if (result.sessionId !== undefined) step.sessionId = result.sessionId;
       // Before the step is recorded as finished, so a snapshot that cannot be taken
       // fails the step through the ordinary path rather than after it.
@@ -439,6 +501,33 @@ export class Runner {
       report(this.config.events, error);
     }
   }
+}
+
+/** Preserves the distinction between no recorded Output and an Output whose value is null. */
+function recordedOutput(step: StepRecord):
+  | { present: false }
+  | { present: true; value: unknown } {
+  return 'output' in step
+    ? { present: true, value: step.output }
+    : { present: false };
+}
+
+/** The current fingerprint representation of one completed step. */
+function recordedArtifacts(step: StepRecord): { name: string; output: unknown } {
+  return {
+    name: step.name,
+    output: step.kind === 'claude'
+      ? {
+          output: recordedOutput(step),
+          finalMessage: step.finalMessage ?? legacyFinalMessage(step) ?? '',
+        }
+      : { output: recordedOutput(step) },
+  };
+}
+
+/** Reads records created before `StepRecord.finalMessage` replaced `text`. */
+function legacyFinalMessage(step: StepRecord): string | undefined {
+  return (step as StepRecord & { text?: string }).text;
 }
 
 function report(events: RunEvents, error: unknown): void {

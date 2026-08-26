@@ -220,7 +220,8 @@ export function createKanbyFactory({
               `1. Read the task: kanby show ${task.guid}\n` +
               `2. Decide its type, your confidence, and whether it needs human triage ` +
               `before any technical work.\n\n` +
-              `Answer through the structured output.`,
+              `Use your final message to explain the classification for a human reviewer. ` +
+              `Put the decision fields in the structured output.`,
             output: z.object({
               type: z.enum(['bug', 'feature', 'documentation', 'chore']),
               confidence: z.number().min(0).max(1),
@@ -265,8 +266,9 @@ export function createKanbyFactory({
               `rather than trust it.\n` +
               `4. Say what you could not verify instead of inventing it; put verification ` +
               `first in the plan when something material is unconfirmed.\n` +
-              `5. Produce evidence, specification, plan, compatibility and risk through ` +
-              `the structured output.`,
+              `5. Use your final message to report the analysis for a human reviewer. ` +
+              `Produce evidence, specification, plan, compatibility and risk through the ` +
+              `structured output.`,
             output: z.object({
               ready: z.boolean(),
               reason: z.string(),
@@ -323,7 +325,6 @@ export function createKanbyFactory({
         // because what the gate below decides about, and what `push` publishes, is
         // whatever the final round settled on.
         let review!: ClaudeHandle<{
-          summary: string;
           completeness: 'complete' | 'partial' | 'missing';
           concerns: string[];
           sideEffectRisk: RiskLevel;
@@ -341,7 +342,7 @@ export function createKanbyFactory({
               ? `You are implementing kanby task ${taskLabel}.\n\n` +
                 `1. Read the task: kanby show ${task.guid} — its content is the prepared brief.\n` +
                 `2. Implement the brief in this workspace, as written. If the brief turns out ` +
-                `to be wrong, follow it as far as it holds and say so in your summary.\n` +
+                `to be wrong, follow it as far as it holds and say so in your final message.\n` +
                 `3. Commit your work on branch ${ctx.input.gitlab.sourceBranch}, referencing ` +
                 `${taskLabel} in the message, and leave the workspace clean. Only what you ` +
                 `commit is reviewed.\n` +
@@ -349,7 +350,8 @@ export function createKanbyFactory({
                 `the review reads the pushed commit.\n` +
                 `5. Do not open a merge request and do not write to the board: a risk gate ` +
                 `reads your change first, and the pipeline publishes what clears it.\n\n` +
-                `Summarise what you did through the structured output.`
+                `Use your final message to report what you changed, what you verified, and ` +
+                `anything the reviewer should know.`
               : `You are revising kanby task ${taskLabel} after review round ${round - 1} ` +
                 `flagged concerns.\n\n` +
                 `1. Read the task: kanby show ${task.guid} — its content is the prepared ` +
@@ -358,8 +360,8 @@ export function createKanbyFactory({
                 `3. Commit the revision on branch ${ctx.input.gitlab.sourceBranch}, leave ` +
                 `the workspace clean, and push.\n` +
                 `4. Do not open a merge request and do not write to the board.\n\n` +
-                `Summarise the revision through the structured output.`,
-            output: z.object({ summary: z.string() }),
+                `Use your final message to report the revision, what you verified, and ` +
+                `anything the reviewer should know.`,
           });
 
           await ctx.step(`publish-implementation${suffix}`, (signal) =>
@@ -368,7 +370,7 @@ export function createKanbyFactory({
               {
                 key: 'kanby-software-factory/implementation',
                 title: 'Implementation',
-                body: withRound(round, implementation.output.summary),
+                body: withRound(round, implementation.finalMessage),
               },
               ctx.workspace,
               signal,
@@ -415,17 +417,11 @@ export function createKanbyFactory({
           review = await ctx.claude({
             name: `review${suffix}`,
             prompt:
-              `You are reviewing kanby task ${taskLabel} before a human reviewer does.\n\n` +
-              `1. Read the task: kanby show ${task.guid} — its content is the prepared ` +
-              `brief, and its Checks output holds the recorded check run.\n` +
-              `2. Get the change: git diff ${reviewed.base} ${reviewed.sha}\n` +
-              `3. Judge completeness against the brief and the change's side-effect, ` +
-              `performance and compatibility risk. Your risk scores decide how much ` +
-              `human attention this change gets, so score the change, not your ` +
-              `confidence in it.\n\n` +
-              `Review, do not fix. Answer through the structured output.`,
+              `/code-review\n\n` +
+              `Review the implementation of kanby task ${taskLabel} at commit ` +
+              `${reviewed.sha}, using ${reviewed.base} as the fixed point. Read the ` +
+              `prepared brief and recorded checks with: kanby show ${task.guid}`,
             output: z.object({
-              summary: z.string(),
               completeness: z.enum(['complete', 'partial', 'missing']),
               concerns: z.array(z.string()),
               sideEffectRisk: risk,
@@ -440,7 +436,7 @@ export function createKanbyFactory({
               {
                 key: 'kanby-software-factory/review',
                 title: 'Review',
-                body: withRound(round, formatReview(review.output)),
+                body: withRound(round, formatReview(review.finalMessage, review.output)),
               },
               ctx.workspace,
               signal,
@@ -499,7 +495,7 @@ export function createKanbyFactory({
               sourceBranch: ctx.input.gitlab.sourceBranch,
               targetBranch: ctx.input.gitlab.targetBranch,
               title: `${taskLabel} ${task.title}`,
-              description: mergeRequestDescription(task, review.output, type),
+              description: mergeRequestDescription(task, review.finalMessage, review.output, type),
             },
             signal,
           ),

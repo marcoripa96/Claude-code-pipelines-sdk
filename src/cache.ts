@@ -14,7 +14,7 @@ export interface CacheKeyParts {
   workspace: string;
   /** The pipeline's input values. */
   pipelineInput: unknown;
-  /** Every upstream step's Output, in order. */
+  /** Every upstream step's recorded artifacts, in order. */
   upstream: { name: string; output: unknown }[];
   /** The resolved model name, so switching models re-runs rather than reusing. */
   model: string;

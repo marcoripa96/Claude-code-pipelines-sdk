@@ -35,13 +35,20 @@ _Avoid_: repo, cwd, sandbox
 
 **Output**:
 The schema-validated object a Claude step returns to pipeline code. The only channel by
-which a session communicates a decision. A step without a schema returns final text
-instead.
+which a session communicates a decision. A step without a schema has no Output; its handle
+still carries the final message.
 _Avoid_: result, response, payload
+
+**Final message**:
+The human-facing report a Claude session ends with. Every Claude step records one,
+whether or not it also declares structured Output. Pipeline code uses Output for decisions;
+humans review the final message.
+_Avoid_: text, response, payload
 
 **External effect**:
 A change to any system of record outside the workspace: a label, a comment, a status, a
-pull request. Always performed by pipeline code from a step's Output, never by Claude.
+pull request. Always performed by pipeline code from a recorded step result, never by
+Claude directly.
 _Avoid_: side effect, action, mutation
 
 ### Execution
@@ -67,7 +74,7 @@ _Avoid_: skip, cache hit, reuse
 
 **Fingerprint**:
 The identity of a step's work: its declaration, its declared input files, the pipeline
-input, the model, and every upstream Output. Written when the step starts, so a step a
+input, the model, and every upstream step's recorded artifacts. Written when the step starts, so a step a
 crash interrupts is still identifiable. Also the cache key of a cacheable step.
 _Avoid_: hash, signature, key
 
@@ -93,7 +100,7 @@ _Avoid_: lock, claim, ownership
 
 **Snapshot**:
 The workspace as one step left it, recorded so a later run that replays that step can put
-the tree back. Outputs replay; files do not, without one.
+the tree back. Recorded results replay; files do not, without one.
 _Avoid_: checkpoint, backup, image
 
 **Cacheable**:
@@ -123,5 +130,5 @@ _Avoid_: cache store, memo table
 
 **Workspace snapshots**:
 An adapter that captures and restores a workspace, so replaying a step restores the files
-it wrote and not only the Output it returned.
+it wrote and not only its recorded result.
 _Avoid_: fs adapter, snapshotter, vcs

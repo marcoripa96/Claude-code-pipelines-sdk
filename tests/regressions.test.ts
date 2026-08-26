@@ -95,7 +95,7 @@ describe('cache keys distinguish values JSON.stringify would flatten', () => {
 describe('cache keys cover every declared option', () => {
   const claudeFor = (calls: { n: number }): ClaudeRunner => async () => {
     calls.n++;
-    return { text: 'answer' };
+    return { finalMessage: 'answer' };
   };
 
   const withMcp = (mcpServers: Record<string, unknown>) =>
@@ -260,7 +260,7 @@ describe('fake() is reusable across runs', () => {
       async run(ctx) {
         const a = await ctx.claude({ name: 'ask', prompt: 'go', retry: 1 });
         const b = await ctx.claude({ name: 'ask', prompt: 'go again', retry: 1 });
-        return [a.text, b.text];
+        return [a.finalMessage, b.finalMessage];
       },
     });
 
@@ -328,7 +328,7 @@ describe('the default Claude runner', () => {
       for (const message of messages) yield message;
     })()) as never;
 
-  test('reads text and structured_output off the result message', async () => {
+  test('reads the final message and structured_output off the result message', async () => {
     const runner = createClaudeRunner({
       query: queryReturning([resultMessage({ structured_output: { ok: true } })]),
     });
@@ -339,7 +339,7 @@ describe('the default Claude runner', () => {
     );
 
     expect(response).toMatchObject({
-      text: 'the answer',
+      finalMessage: 'the answer',
       structuredOutput: { ok: true },
       sessionId: 'sess-1',
     });

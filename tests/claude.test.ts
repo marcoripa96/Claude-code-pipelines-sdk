@@ -21,7 +21,11 @@ function recording(
 describe('claude steps', () => {
   test('validates structured_output against the declared schema', async () => {
     const { runner, requests } = recording([
-      { text: 'done', structuredOutput: { type: 'bug', labels: ['bug'] }, sessionId: 's1' },
+      {
+        finalMessage: 'done',
+        structuredOutput: { type: 'bug', labels: ['bug'] },
+        sessionId: 's1',
+      },
     ]);
 
     const pipeline = definePipeline({
@@ -48,14 +52,14 @@ describe('claude steps', () => {
     expect(requests[0]!.jsonSchema).not.toHaveProperty('$schema');
   });
 
-  test('without a schema the handle carries the final text', async () => {
-    const { runner, requests } = recording([{ text: 'a paragraph of prose' }]);
+  test('without a schema the handle carries the final message', async () => {
+    const { runner, requests } = recording([{ finalMessage: 'a paragraph of prose' }]);
 
     const pipeline = definePipeline({
       name: 'prose',
       async run(ctx) {
         const summary = await ctx.claude({ name: 'summarise', prompt: 'Summarise.' });
-        return summary.text;
+        return summary.finalMessage;
       },
     });
 
@@ -65,7 +69,9 @@ describe('claude steps', () => {
   });
 
   test('an Output that does not satisfy the schema fails the step', async () => {
-    const { runner } = recording([{ text: '', structuredOutput: { type: 'nonsense' } }]);
+    const { runner } = recording([
+      { finalMessage: '', structuredOutput: { type: 'nonsense' } },
+    ]);
 
     const pipeline = definePipeline({
       name: 'bad-output',
@@ -84,7 +90,7 @@ describe('claude steps', () => {
   });
 
   test('a declared schema with no structured_output fails the step', async () => {
-    const { runner } = recording([{ text: 'I forgot to answer' }]);
+    const { runner } = recording([{ finalMessage: 'I forgot to answer' }]);
 
     const pipeline = definePipeline({
       name: 'missing-output',
@@ -106,7 +112,7 @@ describe('claude steps', () => {
     const { runner, requests } = recording([
       new Error('session died'),
       new Error('session died again'),
-      { text: 'ok', structuredOutput: { viable: true } },
+      { finalMessage: 'ok', structuredOutput: { viable: true } },
     ]);
 
     const pipeline = definePipeline({
@@ -163,7 +169,7 @@ describe('claude steps', () => {
   });
 
   test('defaults bypassPermissions, all skills, project settings and the workspace cwd', async () => {
-    const { runner, requests } = recording([{ text: 'ok' }]);
+    const { runner, requests } = recording([{ finalMessage: 'ok' }]);
     const pipeline = definePipeline({
       name: 'defaults',
       async run(ctx) {
@@ -205,7 +211,9 @@ describe('claude steps', () => {
 
     const notViable = await pipeline.run({
       input: undefined,
-      claude: recording([{ text: '', structuredOutput: { viable: false, reason: 'too vague' } }])
+      claude: recording([
+        { finalMessage: '', structuredOutput: { viable: false, reason: 'too vague' } },
+      ])
         .runner,
     });
     expect(notViable.status).toBe('halted');
@@ -215,7 +223,9 @@ describe('claude steps', () => {
     effects.length = 0;
     const viable = await pipeline.run({
       input: undefined,
-      claude: recording([{ text: '', structuredOutput: { viable: true, reason: 'clear' } }]).runner,
+      claude: recording([
+        { finalMessage: '', structuredOutput: { viable: true, reason: 'clear' } },
+      ]).runner,
     });
     expect(viable.status).toBe('completed');
     expect(effects).toEqual(['implement']);

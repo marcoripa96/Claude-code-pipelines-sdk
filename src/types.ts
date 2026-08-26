@@ -60,10 +60,10 @@ export interface StepRecord {
   startedAt: number;
   finishedAt?: number;
   durationMs?: number;
-  /** The schema-validated Output of a Claude step, or a command/code step's value. */
+  /** The optional schema-validated Output of a Claude step, or a command/code step's value. */
   output?: unknown;
-  /** Final assistant text of a Claude step. */
-  text?: string;
+  /** The subagent's final message. Present for every completed Claude step. */
+  finalMessage?: string;
   error?: string;
   exitCode?: number;
   sessionId?: string;
@@ -73,7 +73,7 @@ export interface StepRecord {
   cacheHit?: boolean;
   /**
    * Identity of this step's work: what it declared, its declared input files, the
-   * pipeline input, the model, and every upstream Output. Computed for every step,
+   * pipeline input, the model, and every upstream step's recorded artifacts. Computed for every step,
    * cacheable or not, because it is also how a later run decides whether this step's
    * result still stands. A cacheable step uses the same value as its `cacheKey`.
    */

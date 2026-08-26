@@ -6,14 +6,14 @@ const SESSION = Symbol.for('claude-code-pipelines-sdk.fakeSession');
 interface FakeSession {
   [SESSION]: true;
   output?: unknown;
-  text?: string;
+  finalMessage?: string;
   sessionId?: string;
   messages?: SDKMessage[];
 }
 
 /**
  * One stand-in session. A plain object is the step's Output, a string is its final
- * text, an `Error` is a session that failed, and `session()` sets several at once.
+ * message, an `Error` is a session that failed, and `session()` sets several at once.
  */
 export type Fixture =
   | Record<string, unknown>
@@ -33,7 +33,7 @@ export interface FakeRunner extends ClaudeRunner {
 /** Spells out a stand-in session when the Output alone is not enough. */
 export function session(parts: {
   output?: unknown;
-  text?: string;
+  finalMessage?: string;
   sessionId?: string;
   messages?: SDKMessage[];
 }): FakeSession {
@@ -84,13 +84,14 @@ export function fake(fixtures: Record<string, StepFixture>): FakeRunner {
     const parts = isSession(fixture)
       ? fixture
       : typeof fixture === 'string'
-        ? { text: fixture }
+        ? { finalMessage: fixture }
         : { output: fixture };
 
     for (const message of ('messages' in parts && parts.messages) || []) onMessage(message);
 
     return {
-      text: parts.text ?? (parts.output === undefined ? '' : JSON.stringify(parts.output)),
+      finalMessage:
+        parts.finalMessage ?? (parts.output === undefined ? '' : JSON.stringify(parts.output)),
       structuredOutput: parts.output,
       sessionId: 'sessionId' in parts ? parts.sessionId : `fake-${request.stepName}`,
     } satisfies ClaudeResponse;

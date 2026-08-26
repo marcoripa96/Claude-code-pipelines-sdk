@@ -1,9 +1,9 @@
-# Replay restores Outputs; snapshots restore the workspace
+# Replay restores results; snapshots restore the workspace
 
-A replayed Claude step hands back the Output it produced. It does not hand back the forty
-files it edited. For a pipeline whose steps read the tree the previous step wrote — which
-is every pipeline worth resuming — replaying Outputs over an untouched workspace produces
-a run that is internally consistent and factually wrong.
+A replayed Claude step hands back its final message and optional Output. It does not hand
+back the forty files it edited. For a pipeline whose steps read the tree the previous step
+wrote — which is every pipeline worth resuming — replaying recorded results over an
+untouched workspace produces a run that is internally consistent and factually wrong.
 
 This is why resume was, until now, something a human supervised. It is also the last thing
 standing between a crashed run and an automatic one.

@@ -3,7 +3,14 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
-import { definePipeline, fake, memoryCache, sqliteStorage } from '../src/index.ts';
+import {
+  computeCacheKey,
+  definePipeline,
+  fake,
+  memoryCache,
+  session,
+  sqliteStorage,
+} from '../src/index.ts';
 import type { ClaudeRunner } from '../src/index.ts';
 import { z } from 'zod';
 
@@ -77,7 +84,7 @@ describe('resuming a run', () => {
     expect(changed.steps[0]!.replayed).toBeUndefined();
   });
 
-  test('a downstream step still replays when the step above it produced the same Output', async () => {
+  test('a downstream step still replays when the step above produced the same artifacts', async () => {
     const ran: string[] = [];
     const build = (prompt: string) =>
       definePipeline({
@@ -105,12 +112,207 @@ describe('resuming a run', () => {
       resumeFrom: original,
     });
 
-    // 'first' re-ran, but a fingerprint covers the Output above a step, not whether
-    // that step happened to re-run. Same Output means 'second' has the same work to do.
+    // 'first' re-ran, but its Output and generated final message are both unchanged.
     expect(claude.calls).toHaveLength(2);
     expect(changed.steps[0]!.replayed).toBeUndefined();
     expect(changed.steps[1]!.replayed).toBe(true);
     expect(ran).toEqual(['second']);
+  });
+
+  test('a changed final message invalidates downstream work even when Output is unchanged', async () => {
+    const published: string[] = [];
+    const build = (prompt: string) =>
+      definePipeline({
+        name: 'changed-final-message',
+        async run(ctx) {
+          const first = await ctx.claude({
+            name: 'first',
+            prompt,
+            output: z.object({ value: z.string() }),
+          });
+          await ctx.step('publish', () => {
+            published.push(first.finalMessage);
+            return first.finalMessage;
+          });
+        },
+      });
+
+    const original = await build('original prompt').run({
+      input: undefined,
+      claude: fake({
+        first: session({ output: { value: 'a' }, finalMessage: 'original report' }),
+      }),
+    });
+    const changed = await build('changed prompt').run({
+      input: undefined,
+      claude: fake({
+        first: session({ output: { value: 'a' }, finalMessage: 'changed report' }),
+      }),
+      resumeFrom: original,
+    });
+
+    expect(changed.steps.map((step) => step.replayed)).toEqual([undefined, undefined]);
+    expect(published).toEqual(['original report', 'changed report']);
+  });
+
+  test('an absent Output and a structured null Output are different upstream artifacts', async () => {
+    const inspected: string[] = [];
+    const build = (structured: boolean) =>
+      definePipeline({
+        name: 'output-presence',
+        async run(ctx) {
+          const first = structured
+            ? await ctx.claude({ name: 'first', prompt: 'structured', output: z.null() })
+            : await ctx.claude({ name: 'first', prompt: 'unstructured' });
+          await ctx.step('inspect', () => {
+            const seen = first.output === null ? 'null' : 'absent';
+            inspected.push(seen);
+            return seen;
+          });
+        },
+      });
+
+    const original = await build(false).run({
+      input: undefined,
+      claude: fake({ first: 'same report' }),
+    });
+    const changed = await build(true).run({
+      input: undefined,
+      claude: fake({
+        first: session({ output: null, finalMessage: 'same report' }),
+      }),
+      resumeFrom: original,
+    });
+
+    expect(changed.steps.map((step) => step.replayed)).toEqual([undefined, undefined]);
+    expect(changed.steps[1]!.output).toBe('null');
+    expect(inspected).toEqual(['absent', 'null']);
+  });
+
+  test('direct legacy run records replay their text as the final message', async () => {
+    const claude = fake({ ask: 'old report' });
+    const pipeline = definePipeline({
+      name: 'legacy-final-message',
+      async run(ctx) {
+        return (await ctx.claude({ name: 'ask', prompt: 'report' })).finalMessage;
+      },
+    });
+    const original = await pipeline.run({ input: undefined, claude });
+    const legacy = {
+      ...original,
+      steps: original.steps.map((step) => {
+        const { finalMessage, ...record } = step;
+        return { ...record, text: finalMessage };
+      }),
+    } as typeof original;
+
+    const resumed = await pipeline.run({ input: undefined, claude, resumeFrom: legacy });
+
+    expect(resumed.output).toBe('old report');
+    expect(resumed.steps[0]!.finalMessage).toBe('old report');
+    expect(resumed.steps[0]!.replayed).toBe(true);
+    expect(claude.calls).toHaveLength(1);
+  });
+
+  test('legacy downstream fingerprints still replay completed External effects', async () => {
+    const cwd = await workspace();
+    let effects = 0;
+    const effect = () => ++effects;
+    const claude = fake({ ask: { ok: true } });
+    const pipeline = definePipeline({
+      name: 'legacy-fingerprint',
+      async run(ctx) {
+        await ctx.claude({
+          name: 'ask',
+          prompt: 'decide',
+          output: z.object({ ok: z.boolean() }),
+        });
+        await ctx.step('effect', effect);
+      },
+    });
+    const original = await pipeline.run({ input: undefined, workspace: cwd, claude });
+    const legacyEffectFingerprint = await computeCacheKey({
+      pipeline: 'legacy-fingerprint',
+      stepName: 'effect',
+      kind: 'code',
+      config: { source: effect.toString() },
+      inputs: [],
+      workspace: cwd,
+      pipelineInput: undefined,
+      upstream: [{ name: 'ask', output: { ok: true } }],
+      model: 'default',
+    });
+    const legacy = {
+      ...original,
+      steps: original.steps.map((step) =>
+        step.name === 'effect' ? { ...step, fingerprint: legacyEffectFingerprint } : step,
+      ),
+    };
+
+    const resumed = await pipeline.run({
+      input: undefined,
+      workspace: cwd,
+      claude,
+      resumeFrom: legacy,
+    });
+
+    expect(effects).toBe(1);
+    expect(resumed.steps[1]!.replayed).toBe(true);
+  });
+
+  test('legacy fingerprints do not replay when an omitted final message changed', async () => {
+    const cwd = await workspace();
+    const reports: string[] = [];
+    const effect = (report: string) => void reports.push(report);
+    const build = (prompt: string) =>
+      definePipeline({
+        name: 'safe-legacy-fingerprint',
+        async run(ctx) {
+          const ask = await ctx.claude({
+            name: 'ask',
+            prompt,
+            output: z.object({ ok: z.boolean() }),
+          });
+          await ctx.step('effect', () => effect(ask.finalMessage));
+        },
+      });
+    const original = await build('old prompt').run({
+      input: undefined,
+      workspace: cwd,
+      claude: fake({
+        ask: session({ output: { ok: true }, finalMessage: 'old report' }),
+      }),
+    });
+    const effectSource = '() => effect(ask.finalMessage)';
+    const legacyEffectFingerprint = await computeCacheKey({
+      pipeline: 'safe-legacy-fingerprint',
+      stepName: 'effect',
+      kind: 'code',
+      config: { source: effectSource },
+      inputs: [],
+      workspace: cwd,
+      pipelineInput: undefined,
+      upstream: [{ name: 'ask', output: { ok: true } }],
+      model: 'default',
+    });
+    const legacy = {
+      ...original,
+      steps: original.steps.map((step) =>
+        step.name === 'effect' ? { ...step, fingerprint: legacyEffectFingerprint } : step,
+      ),
+    };
+
+    const resumed = await build('new prompt').run({
+      input: undefined,
+      workspace: cwd,
+      claude: fake({
+        ask: session({ output: { ok: true }, finalMessage: 'new report' }),
+      }),
+      resumeFrom: legacy,
+    });
+
+    expect(resumed.steps[1]!.replayed).toBeUndefined();
+    expect(reports).toEqual(['old report', 'new report']);
   });
 
   test('a changed Output above a step breaks the chain and re-runs it', async () => {
@@ -176,7 +378,7 @@ describe('resuming a run', () => {
         async run(ctx) {
           const said = await ctx.claude({ name: 'think', prompt: 'think' });
           const shell = await ctx.command({ name: 'echo', command: 'echo hello' });
-          return `${said.text}:${shell.stdout.trim()}`;
+          return `${said.finalMessage}:${shell.stdout.trim()}`;
         },
       });
 
@@ -268,7 +470,11 @@ describe('resuming from a rebuilt record', () => {
 
     const claude: ClaudeRunner = async (request) => {
       sessions.push(request.stepName);
-      return { text: 'an answer', structuredOutput: { label: 'bug' }, sessionId: 'sess-1' };
+      return {
+        finalMessage: 'an answer',
+        structuredOutput: { label: 'bug' },
+        sessionId: 'sess-1',
+      };
     };
 
     const build = () =>
@@ -295,13 +501,13 @@ describe('resuming from a rebuilt record', () => {
     // Storage is write-only by ADR 0003, so the consumer reads it with their own SQL
     // and hands the SDK back a record it never loaded itself.
     const rows = db
-      .query('SELECT name, kind, status, output, text, session_id, fingerprint FROM steps WHERE run_id = $id ORDER BY idx')
+      .query('SELECT name, kind, status, output, final_message, session_id, fingerprint FROM steps WHERE run_id = $id ORDER BY idx')
       .all({ $id: failed.id }) as {
       name: string;
       kind: string;
       status: string;
       output: string | null;
-      text: string | null;
+      final_message: string | null;
       session_id: string | null;
       fingerprint: string | null;
     }[];
@@ -317,7 +523,7 @@ describe('resuming from a rebuilt record', () => {
         status: row.status as 'completed' | 'failed',
         startedAt: 0,
         output: row.output === null ? undefined : JSON.parse(row.output),
-        text: row.text ?? undefined,
+        finalMessage: row.final_message ?? undefined,
         sessionId: row.session_id ?? undefined,
         fingerprint: row.fingerprint ?? undefined,
       })),
@@ -357,6 +563,17 @@ describe('resuming from a rebuilt record', () => {
     const columns = (db.query('PRAGMA table_info(steps)').all() as { name: string }[]).map((c) => c.name);
     expect(columns).toContain('fingerprint');
     expect(columns).toContain('replayed');
+    expect(columns).toContain('final_message');
+
+    db.run(`
+      INSERT INTO runs (id, pipeline, status, workspace, started_at)
+      VALUES ('legacy-run', 'legacy', 'completed', '/tmp', 1)
+    `);
+    db.run(`
+      INSERT INTO steps (id, run_id, idx, name, kind, status, started_at, text)
+      VALUES ('legacy-step', 'legacy-run', 0, 'ask', 'claude', 'completed', 1, 'old report')
+    `);
+    expect(storage.readRun('legacy-run')?.steps[0]?.finalMessage).toBe('old report');
 
     const pipeline = definePipeline({
       name: 'migrated',
@@ -368,7 +585,9 @@ describe('resuming from a rebuilt record', () => {
     const result = await pipeline.run({ input: undefined, storage });
     expect(result.status).toBe('completed');
     expect(
-      (db.query('SELECT fingerprint FROM steps').get() as { fingerprint: string | null }).fingerprint,
+      (db.query('SELECT fingerprint FROM steps WHERE id = ?').get(result.steps[0]!.id) as {
+        fingerprint: string | null;
+      }).fingerprint,
     ).toBeTruthy();
   });
 });

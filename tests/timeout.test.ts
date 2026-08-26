@@ -88,7 +88,7 @@ describe('step timeouts', () => {
   test('a claude step honours its timeout', async () => {
     const slowClaude = async (_request: ClaudeRequest): Promise<ClaudeResponse> => {
       await sleep(5000);
-      return { text: 'too late' };
+      return { finalMessage: 'too late' };
     };
 
     const pipeline = definePipeline({
