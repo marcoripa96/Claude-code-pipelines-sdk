@@ -1,5 +1,5 @@
+import type { ClaudeRunner } from './claude.ts';
 import type {
-  ClaudeRunner,
   InferInput,
   CacheAdapter,
   RunEvents,
@@ -10,7 +10,7 @@ import type {
   WorkspaceSnapshots,
 } from './types.ts';
 import { PipelineInputError, RunNotFoundError, isHalt } from './errors.ts';
-import { Runner } from './runner.ts';
+import { Runner, type StepDefaults } from './runner.ts';
 import { RunContext } from './context.ts';
 
 export interface PipelineDefinition<S extends Schema | undefined, O> {
@@ -22,6 +22,16 @@ export interface PipelineDefinition<S extends Schema | undefined, O> {
    * record the steps a halt stopped the run from reaching — see ADR 0007.
    */
   steps?: readonly string[];
+  /**
+   * Step options this pipeline sets once for all of its steps, each still overridable
+   * where a step disagrees.
+   *
+   * `onCrash` is here because a pipeline whose effects are uniformly repeatable — every
+   * write a set-operation, every create an upsert — is stating a property of itself, and
+   * repeating that at two dozen call sites is the kind of repetition that stops being
+   * read (ADR 0009).
+   */
+  defaults?: StepDefaults;
   run(ctx: RunContext<S extends Schema<infer T> ? T : undefined>): Promise<O> | O;
 }
 
@@ -131,6 +141,7 @@ export function definePipeline<S extends Schema | undefined = undefined, O = unk
         input,
         model: options.model,
         declaredSteps: definition.steps ?? [],
+        defaults: definition.defaults,
         events: options.on ?? {},
         storage: options.storage,
         cache: options.cache,

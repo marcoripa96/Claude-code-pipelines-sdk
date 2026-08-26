@@ -3,7 +3,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { definePipeline, memoryCache, StepTimeoutError } from '../src/index.ts';
-import type { ClaudeRequest, ClaudeResponse } from '../src/types.ts';
+import type { ClaudeRequest, ClaudeResponse } from '../src/claude.ts';
 
 const workspace = () => mkdtemp(join(tmpdir(), 'timeout-test-'));
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

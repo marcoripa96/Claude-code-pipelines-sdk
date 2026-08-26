@@ -217,6 +217,21 @@ Claude and command steps default to `onCrash: 'rerun'` — they act on the works
 snapshots restore, so repeating one costs tokens rather than correctness. `ctx.step`
 defaults to `'fail'`, because it is where External effects live.
 
+A pipeline whose effects are *uniformly* repeatable — every write a set-operation, every
+create an upsert — is stating a property of itself, and says so once instead of at every
+call site:
+
+```ts
+definePipeline({
+  name: 'software-factory',
+  defaults: { onCrash: 'rerun' },   // every step, unless it disagrees
+  async run(ctx) { /* ... */ },
+});
+```
+
+A step that declares its own `onCrash` still wins, and a step with a `reconcile` never
+consults either: asking is always better than assuming.
+
 **Replay restores Outputs, not files.** A replayed session hands back the Output it
 produced, not the forty files it edited. Give the run a `WorkspaceSnapshots` adapter and
 the tree comes back too:
@@ -232,6 +247,11 @@ take it). The workspace must be the repository's top level, since restoring rewr
 whole tree. On a resumed run nothing is
 restored while steps replay; the tree is put back once, at the first step that must do
 real work (ADR 0011).
+
+Resume a snapshotted run *without* the adapter and it stops with
+`WorkspaceUnrestorableError` rather than replaying Outputs onto a tree it never put back.
+Silently continuing would hand every step below a workspace that does not match the
+record it was just given.
 
 **The code between steps runs again.** Resuming re-executes the pipeline function from the
 top, so anything the driver reads for itself must come from a step — otherwise it either

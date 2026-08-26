@@ -1,23 +1,31 @@
 import type { Runner } from './runner.ts';
 import type {
-  ClaudeHandle,
-  ClaudeRequest,
-  ClaudeStepOptions,
   CacheOptions,
   CodeStepOptions,
-  CommandHandle,
-  CommandStepOptions,
   CrashPolicy,
   Infer,
   Schema,
   StepRecord,
 } from './types.ts';
-import type { CommandOutcome } from './command.ts';
+import type { CommandHandle, CommandOutcome, CommandStepOptions } from './command.ts';
 import { assertCommandOk, commandHandle, runCommand } from './command.ts';
 import { ClaudeStepError, HaltSignal, IndeterminateStepError, isHalt } from './errors.ts';
+import type { ClaudeHandle, ClaudeRequest, ClaudeStepOptions } from './claude.ts';
 import { createClaudeRunner } from './claude.ts';
 import { computeCacheKey } from './cache.ts';
 import { Limiter } from './limiter.ts';
+
+/** One step's entry in the cache: the same key, for reading and for writing. */
+interface CacheSlot {
+  get(): Promise<unknown | undefined>;
+  set(value: unknown): Promise<void>;
+}
+
+/** An answer `settle()` found, and which of the three places it came from. */
+interface Settled {
+  value: unknown;
+  from: 'replay' | 'reconcile' | 'cache';
+}
 
 /**
  * What a pipeline's `run` function is handed. Every method here records a step;
@@ -55,10 +63,10 @@ export class RunContext<I = unknown> {
     return this.runner.execute(
       this.runner.beginStep(name, 'code'),
       async (record, signal) => {
-        const settled = await this.settle(record, false, (prior) => prior.output, {
+        const settled = await this.settle(record, (prior) => prior.output, {
           // A code step is where External effects live, so a repeat is the expensive
           // mistake: it stops and asks unless told how to find out (ADR 0009).
-          onCrash: options.onCrash ?? 'fail',
+          onCrash: this.onCrash(options.onCrash, 'fail'),
           reconcile: options.reconcile,
           signal,
         });
@@ -111,7 +119,9 @@ export class RunContext<I = unknown> {
     return this.runner.execute(
       this.runner.beginStep(name, 'value'),
       async (record, signal) => {
-        const settled = await this.settle(record, false, (prior) => prior.output, {
+        // A recorded value is a number or a string; redoing one costs nothing, so it
+        // never asks and never consults the pipeline's default.
+        const settled = await this.settle(record, (prior) => prior.output, {
           onCrash: 'rerun',
           signal,
         });
@@ -134,30 +144,27 @@ export class RunContext<I = unknown> {
   claude<S extends Schema>(
     options: ClaudeStepOptions<S> & { output: S },
   ): Promise<ClaudeHandle<Infer<S>>>;
-  claude(options: ClaudeStepOptions<Schema | undefined>): Promise<ClaudeHandle<unknown>> {
-    const cacheable = this.cacheable(options.cache);
-    // Computed while the step is being identified, and reused to make the request.
-    let jsonSchema: Record<string, unknown> | undefined;
+  async claude(options: ClaudeStepOptions<Schema | undefined>): Promise<ClaudeHandle<unknown>> {
+    // Settled before the step begins. Nothing about it depends on the run, and passing
+    // it from `identify` to `work` through a mutable binding would make the order the
+    // runner happens to call those two in load-bearing.
+    const jsonSchema = options.output ? await toJsonSchema(options.name, options.output) : undefined;
 
     return this.runner.execute(this.runner.beginStep(options.name, 'claude'), async (step, signal) => {
-      if (cacheable) {
-        step.cacheKey = step.fingerprint;
-        step.cacheHit = false;
-      }
+      const cache = this.cacheSlot(step, options.cache);
 
       const settled = await this.settle(
         step,
-        cacheable,
         (prior) => ({ output: prior.output, text: prior.text ?? '', sessionId: prior.sessionId }),
         // A session acts on the workspace, which snapshots restore, so repeating one
         // costs tokens rather than correctness.
-        { onCrash: options.onCrash ?? 'rerun', signal },
+        { onCrash: this.onCrash(options.onCrash, 'rerun'), signal },
+        cache,
       );
 
       if (settled) {
         const stored = settled.value as { output?: unknown; text: string; sessionId?: string };
-        if (!step.replayed) step.cacheHit = true;
-        step.sessionId = stored.sessionId;
+        if (settled.from === 'cache') step.cacheHit = true;
         const handle: ClaudeHandle<unknown> = {
           name: options.name,
           output: stored.output,
@@ -166,31 +173,24 @@ export class RunContext<I = unknown> {
           cacheHit: step.cacheHit === true,
           step,
         };
-        return { value: handle, output: handle.output, text: handle.text };
+        return { value: handle, ...produced(handle) };
       }
 
       const handle = await this.runClaudeStep(options, jsonSchema, step, signal);
-      if (cacheable) {
-        await this.runner.config.cache!.set(step.fingerprint!, {
-          output: handle.output,
-          text: handle.text,
-          sessionId: handle.sessionId,
-        });
-      }
-      return { value: handle, output: handle.output, text: handle.text };
+      // The same three fields the runner records are the three the cache keeps, and
+      // `settle` reads them back into the branch above.
+      await cache?.set(produced(handle));
+      return { value: handle, ...produced(handle) };
     }, {
       timeout: options.timeout,
       // Derived from the options themselves rather than a hand-written list, so a
       // field added to ClaudeStepOptions cannot quietly fall out of the key.
-      identify: async () => {
-        jsonSchema = options.output ? await toJsonSchema(options.name, options.output) : undefined;
-        return this.fingerprint(options.name, 'claude', options.cache, {
+      identify: () =>
+        this.fingerprint(options.name, 'claude', options.cache, {
           ...stepConfig(options),
-          output: undefined,
           jsonSchema,
           model: options.model ?? this.runner.config.model,
-        });
-      },
+        }),
     });
   }
 
@@ -240,7 +240,6 @@ export class RunContext<I = unknown> {
           }
           output = options.output.parse(response.structuredOutput);
         }
-        step.sessionId = response.sessionId;
         return {
           name: options.name,
           output,
@@ -310,22 +309,20 @@ export class RunContext<I = unknown> {
   ): Promise<CommandHandle> {
     const name = step.name;
     const cwd = options.cwd ?? this.workspace;
-    const cacheable = this.cacheable(options.cache);
     return this.runner.execute(step, async (record, signal) => {
-      if (cacheable) {
-        record.cacheKey = record.fingerprint;
-        record.cacheHit = false;
-      }
+      const cache = this.cacheSlot(record, options.cache);
 
-      const settled = await this.settle(record, cacheable, (prior) => prior.output, {
+      const settled = await this.settle(record, (prior) => prior.output, {
         // A command acts on the workspace by default; one that reaches outside it
         // should say `onCrash: 'fail'`.
-        onCrash: options.onCrash ?? 'rerun',
+        onCrash: this.onCrash(options.onCrash, 'rerun'),
         signal,
-      });
+      }, cache);
       if (settled) {
         const outcome = settled.value as CommandOutcome;
-        if (!record.replayed) record.cacheHit = true;
+        if (settled.from === 'cache') record.cacheHit = true;
+        // Annotated rather than returned: an exit code must be on the record even when
+        // the step goes on to throw for having it.
         record.exitCode = outcome.exitCode;
         return { value: commandHandle(name, outcome, record, record.cacheHit === true), output: outcome };
       }
@@ -333,9 +330,8 @@ export class RunContext<I = unknown> {
       const outcome = await runCommand(options, cwd, signal);
       record.exitCode = outcome.exitCode;
       assertCommandOk(options, outcome);
-      if (cacheable) await this.runner.config.cache!.set(record.fingerprint!, outcome);
-      const handle = commandHandle(name, outcome, record, false);
-      return { value: handle, output: outcome };
+      await cache?.set(outcome);
+      return { value: commandHandle(name, outcome, record, false), output: outcome };
     }, {
       timeout: options.timeout,
       identify: () => this.fingerprint(name, 'command', options.cache, stepConfig(options), upstream),
@@ -370,11 +366,34 @@ export class RunContext<I = unknown> {
   }
 
   /**
-   * Whether a cacheable step may consult the cache: it opted in and the run was given
-   * an adapter. Steps are never cacheable by default.
+   * The cache as one step sees it: one key, used both to read and to write, or nothing
+   * at all when the step did not opt in or the run was given no adapter. Steps are never
+   * cacheable by default.
+   *
+   * Handing out a slot rather than a boolean is what keeps the key in one place. A
+   * caller cannot consult one cache entry and write another, and cannot reach the
+   * adapter without having been given the entry it is allowed to touch.
    */
-  private cacheable(cache: CacheOptions | undefined): boolean {
-    return Boolean(cache && this.runner.config.cache);
+  private cacheSlot(record: StepRecord, cache: CacheOptions | undefined): CacheSlot | undefined {
+    const adapter = this.runner.config.cache;
+    if (!cache || !adapter) return undefined;
+    const key = record.fingerprint!;
+    record.cacheKey = key;
+    record.cacheHit = false;
+    return {
+      get: async () => adapter.get(key),
+      set: async (value) => {
+        await adapter.set(key, value);
+      },
+    };
+  }
+
+  /**
+   * A step's crash policy: what the step declared, else what the pipeline declared for
+   * all of its steps, else the default for the kind (ADR 0009).
+   */
+  private onCrash(declared: CrashPolicy | undefined, byKind: CrashPolicy): CrashPolicy {
+    return declared ?? this.runner.config.defaults?.onCrash ?? byKind;
   }
 
   /**
@@ -388,26 +407,30 @@ export class RunContext<I = unknown> {
    *    because it is the more specific answer and it is free.
    * 2. **The resumed run was in the middle of it when its process died.** Nobody knows
    *    whether it landed; ADR 0009 decides, below.
-   * 3. **The cache holds it.** Only for a step that opted in.
+   * 3. **The cache holds it.** Only for a step that was given a slot.
    * 4. **Nothing has.** Do the work — and first, put the workspace back to where the
    *    replayed steps left it, because that is the tree this work expects.
+   *
+   * Which of the three it was comes back on `from`. A caller needs to know — a cache hit
+   * is recorded as one, a replayed step and a reconciled effect are not — and this is
+   * the only place that can say without guessing.
    */
   private async settle(
     record: StepRecord,
-    cacheable: boolean,
     fromReplay: (prior: StepRecord) => unknown,
     crash: {
       onCrash: CrashPolicy;
       reconcile?: (signal: AbortSignal) => unknown;
       signal: AbortSignal;
     },
-  ): Promise<{ value: unknown } | undefined> {
+    cache?: CacheSlot,
+  ): Promise<Settled | undefined> {
     const fingerprint = record.fingerprint!;
 
     const prior = this.runner.replay(fingerprint);
     if (prior) {
       this.runner.noteReplayed(record, prior);
-      return { value: fromReplay(prior) };
+      return { value: fromReplay(prior), from: 'replay' };
     }
 
     const inFlight = this.runner.inFlight(fingerprint);
@@ -419,7 +442,7 @@ export class RunContext<I = unknown> {
         const found = await crash.reconcile(crash.signal);
         if (found !== undefined) {
           record.recovered = 'reconciled';
-          return { value: found };
+          return { value: found, from: 'reconcile' };
         }
         // Asked and answered: the effect did not land, so repeating it is safe. This is
         // what having a reconcile buys — `onCrash` decides only what to do when there
@@ -432,9 +455,9 @@ export class RunContext<I = unknown> {
       }
     }
 
-    if (cacheable) {
-      const hit = await this.runner.config.cache!.get(fingerprint);
-      if (hit !== undefined) return { value: hit };
+    if (cache) {
+      const hit = await cache.get();
+      if (hit !== undefined) return { value: hit, from: 'cache' };
     }
 
     await this.runner.restoreWorkspace(crash.signal, record);
@@ -448,6 +471,11 @@ export class RunContext<I = unknown> {
   halt(reason: string): never {
     throw new HaltSignal(reason);
   }
+}
+
+/** What a Claude step produced, as the runner records it — cached or freshly run alike. */
+function produced(handle: ClaudeHandle<unknown>): { output: unknown; text: string; sessionId?: string } {
+  return { output: handle.output, text: handle.text, sessionId: handle.sessionId };
 }
 
 /** A command step's recorded name: what it declared, else the command itself. */
@@ -466,11 +494,15 @@ function stepConfig(options: object): Record<string, unknown> {
   // in a deadline should still share a cache entry.
   // `onCrash` joins them: what a step does about a crash it did not have does not
   // change the result it produces.
+  // `output` is excluded because it is already in the key in the form that matters: the
+  // caller adds the JSON Schema it compiles to, and hashing the Zod object as well would
+  // key on the identity of a class instance.
   const {
     name: _name,
     cache: _cache,
     timeout: _timeout,
     onCrash: _onCrash,
+    output: _output,
     ...rest
   } = options as Record<string, unknown>;
   return rest;

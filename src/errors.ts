@@ -105,6 +105,28 @@ export class RunTakenError extends Error {
   }
 }
 
+/**
+ * A resumed run reached a step whose earlier result came with a workspace snapshot, and
+ * this run was given no `snapshots` adapter to put that tree back with.
+ *
+ * Replaying the Output while silently leaving the workspace untouched would hand the
+ * steps below it a tree that does not match the record they are being told about, so the
+ * run stops instead. Resume with the same `snapshots` adapter the earlier run used.
+ */
+export class WorkspaceUnrestorableError extends Error {
+  readonly stepName: string;
+
+  constructor(stepName: string) {
+    super(
+      `Step "${stepName}" replays a result recorded with a workspace snapshot, but this ` +
+        'run was given no `snapshots` adapter to restore it with. Pass the same ' +
+        'WorkspaceSnapshots the earlier run used.',
+    );
+    this.name = 'WorkspaceUnrestorableError';
+    this.stepName = stepName;
+  }
+}
+
 /** A run id was handed to `resumeFrom`, but no adapter could load it. */
 export class RunNotFoundError extends Error {
   readonly runId: string;

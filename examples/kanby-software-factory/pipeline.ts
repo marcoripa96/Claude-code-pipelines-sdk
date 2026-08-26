@@ -4,143 +4,25 @@ import {
   type ClaudeHandle,
 } from '@marcoripa96/claude-code-pipelines-sdk';
 import { z } from 'zod';
+import {
+  RISK_LEVELS,
+  type KanbyFactoryDependencies,
+  type RiskLevel,
+} from './contracts.ts';
+import {
+  describe,
+  formatAnalysis,
+  formatClassification,
+  formatCommandOutput,
+  formatReview,
+  label,
+  mergeRequestDescription,
+  peakRisk,
+  rank,
+  withRound,
+} from './format.ts';
 
-export type TaskStatus = 'backlog' | 'todo' | 'in_progress' | 'in_review' | 'done';
-
-export type RiskLevel = 'none' | 'low' | 'medium' | 'high';
-
-export interface KanbyTask {
-  guid: string;
-  displayNumber: number | null;
-  title: string;
-  description: string;
-  content: string;
-  status: TaskStatus;
-  blocked: { reason: string } | null;
-  /** The agent currently holding the task, if any. What a recovered claim asks about. */
-  claimedBy: string | null;
-  updatedMs: number;
-  outputKeys: string[];
-}
-
-export interface TaskOutputInput {
-  key: string;
-  title: string;
-  body: string;
-}
-
-export interface MergeRequestRef {
-  provider: 'gitlab';
-  host: string;
-  project: string | number;
-  iid: number;
-  url: string;
-  title: string;
-  sourceBranch: string;
-  targetBranch: string;
-  state: 'opened' | 'closed' | 'merged' | 'locked';
-}
-
-export interface GitLabDestination {
-  host: string;
-  project: string;
-  sourceBranch: string;
-  targetBranch: string;
-}
-
-export interface KanbyClient {
-  /** The agent identity this client acts as. A recovered run asks whether it already holds a claim. */
-  readonly actor: string;
-  get(taskGuid: string, workspace: string, signal: AbortSignal): Promise<KanbyTask>;
-  claim(task: KanbyTask, workspace: string, signal: AbortSignal): Promise<void>;
-  release(taskGuid: string, workspace: string, signal: AbortSignal): Promise<void>;
-  move(
-    taskGuid: string,
-    status: Extract<TaskStatus, 'todo' | 'in_progress' | 'in_review'>,
-    workspace: string,
-    signal: AbortSignal,
-  ): Promise<void>;
-  update(
-    taskGuid: string,
-    changes: { content: string },
-    workspace: string,
-    signal: AbortSignal,
-  ): Promise<void>;
-  block(taskGuid: string, reason: string, workspace: string, signal: AbortSignal): Promise<void>;
-  putOutput(
-    taskGuid: string,
-    output: TaskOutputInput,
-    workspace: string,
-    signal: AbortSignal,
-  ): Promise<void>;
-  linkMergeRequest(
-    taskGuid: string,
-    mergeRequest: MergeRequestRef,
-    workspace: string,
-    signal: AbortSignal,
-  ): Promise<void>;
-}
-
-export interface RepositoryClient {
-  preflight(
-    workspace: string,
-    destination: GitLabDestination,
-    signal: AbortSignal,
-  ): Promise<void>;
-  stage(
-    workspace: string,
-    sourceBranch: string,
-    maxDiffBytes: number,
-    signal: AbortSignal,
-  ): Promise<{ truncated: boolean }>;
-  commit(
-    workspace: string,
-    task: KanbyTask,
-    sourceBranch: string,
-    signal: AbortSignal,
-  ): Promise<{ sha: string }>;
-  push(
-    workspace: string,
-    destination: GitLabDestination,
-    sha: string,
-    signal: AbortSignal,
-  ): Promise<void>;
-}
-
-export interface ChecksClient {
-  run(
-    workspace: string,
-    command: string,
-    signal: AbortSignal,
-  ): Promise<{ stdout: string; stderr: string; exitCode: number }>;
-}
-
-export interface MergeRequestsClient {
-  preflight(
-    destination: Pick<GitLabDestination, 'host' | 'project' | 'targetBranch'>,
-    signal: AbortSignal,
-  ): Promise<void>;
-  ensure(
-    request: {
-      host: string;
-      project: string | number;
-      sourceBranch: string;
-      targetBranch: string;
-      title: string;
-      description: string;
-    },
-    signal: AbortSignal,
-  ): Promise<MergeRequestRef>;
-}
-
-export interface KanbyFactoryDependencies {
-  kanby: KanbyClient;
-  repository: RepositoryClient;
-  mergeRequests: MergeRequestsClient;
-  checks: ChecksClient;
-}
-
-const risk = z.enum(['none', 'low', 'medium', 'high']);
+const risk = z.enum(RISK_LEVELS);
 
 const input = z.object({
   taskGuid: z.string().min(1),
@@ -174,20 +56,6 @@ const PREPARATION_KEYS = [
 const READ_ONLY_TOOLS = ['Bash', 'Read', 'Grep', 'Glob'];
 
 /**
- * What a step does when a crashed run left it in flight and nobody knows whether it
- * landed (ADR 0009). `ctx.step` defaults to stopping and asking a human, which is right
- * for an unknown effect and wrong for every effect here but one.
- *
- * Every board write below is a set-operation — move, block, release, upsert an output,
- * overwrite the content — so doing it twice is doing it once. Git and GitLab are the
- * same by construction: `commit` recognises its own marker on HEAD, `push` pushes a sha
- * that is already there, and `ensure` finds the merge request before it creates one.
- * These are properties of the adapters, and this is where the pipeline says it relies
- * on them.
- */
-const REPEATABLE = { onCrash: 'rerun' } as const;
-
-/**
  * One pipeline for every open task: it reads where the task is on the board and
  * runs exactly the stages that stage still needs. A `backlog` task goes through
  * intake (classify -> analyze -> brief -> todo) and straight on into delivery; a
@@ -212,6 +80,23 @@ export function createKanbyFactory({
   return definePipeline({
     name: 'kanby-software-factory',
     input,
+    /**
+     * What every step here does when a crashed run left it in flight and nobody knows
+     * whether it landed (ADR 0009). `ctx.step` alone defaults to stopping and asking a
+     * human, which is right for an unknown effect and wrong for every effect in this
+     * pipeline but one.
+     *
+     * Every board write below is a set-operation — move, block, release, upsert an
+     * output, overwrite the content — so doing it twice is doing it once. Git and GitLab
+     * are the same by construction: `commit` recognises its own marker on HEAD, `push`
+     * pushes a sha that is already there, and `ensure` finds the merge request before it
+     * creates one. These are properties of the adapters, and this is where the pipeline
+     * says once that it relies on them.
+     *
+     * The exception is `claim`, which is guarded on the snapshot it was read from and so
+     * says for itself how to settle the question.
+     */
+    defaults: { onCrash: 'rerun' },
     steps: [
       'fetch-task',
       'claim',
@@ -249,7 +134,6 @@ export function createKanbyFactory({
     async run(ctx) {
       const task = await ctx.step('fetch-task', (signal) =>
         kanby.get(ctx.input.taskGuid, ctx.workspace, signal),
-        REPEATABLE,
       );
 
       // Every guard that the fetched snapshot alone can decide runs before the
@@ -281,33 +165,51 @@ export function createKanbyFactory({
       );
       const taskLabel = label(task);
 
-      // Every stop-and-ask-a-human path is this ritual: record why on the card,
-      // then leave the card free for a human to act on. Declared once so the
-      // invariant "a stop always releases the claim" holds everywhere.
+      /**
+       * Every way this run stops after the claim ends here: record why on the card,
+       * then leave the card free for a human to act on. One implementation, because it
+       * is one invariant — a stop always releases the claim.
+       *
+       * `bestEffort` is the failing-run path. There, a board that is itself unreachable
+       * must not replace the error that got us here: a card left claimed is visible on
+       * the board, a swallowed cause is not.
+       */
+      const handOff = async (reason: string, { bestEffort = false } = {}): Promise<void> => {
+        const attempt = async (effect: () => Promise<unknown>): Promise<void> => {
+          if (!bestEffort) {
+            await effect();
+            return;
+          }
+          try {
+            await effect();
+          } catch {
+            // Deliberately swallowed; see above.
+          }
+        };
+        await attempt(() =>
+          ctx.step('handoff-block', (signal) =>
+            kanby.block(task.guid, reason, ctx.workspace, signal),
+          ),
+        );
+        await attempt(() =>
+          ctx.step('handoff-release', (signal) =>
+            kanby.release(task.guid, ctx.workspace, signal),
+          ),
+        );
+      };
+
+      /** The gate form: hand off, then end the run successfully at the gate's reason. */
       const handOffToHuman = (reason: string): Promise<never> =>
-        ctx
-          .step(
-            'handoff-block',
-            (signal) => kanby.block(task.guid, reason, ctx.workspace, signal),
-            REPEATABLE,
-          )
-          .then(() =>
-            ctx.step('handoff-release', (signal) =>
-              kanby.release(task.guid, ctx.workspace, signal),
-              REPEATABLE,
-            ),
-          )
-          .then(() => ctx.halt(reason));
+        handOff(reason).then(() => ctx.halt(reason));
 
       try {
         await stages();
       } catch (error) {
         if (isHalt(error)) throw error;
-        // A thrown step is the factory's other way of stopping — usually something
-        // it needs is not provisioned. Same ritual, best-effort so a board that is
-        // itself unreachable cannot mask the failure that got us here, and the
-        // original error still fails the run.
-        await handOffOnFailure(error);
+        // A thrown step is the factory's other way of stopping — usually something it
+        // needs is not provisioned. Same ritual, best-effort, and the original error
+        // still fails the run.
+        await handOff(`Run failed: ${describe(error)}`, { bestEffort: true });
         throw error;
       }
 
@@ -347,7 +249,6 @@ export function createKanbyFactory({
               ctx.workspace,
               signal,
             ),
-            REPEATABLE,
           );
           if (
             classification.output.requiresHumanTriage ||
@@ -402,7 +303,6 @@ export function createKanbyFactory({
               ctx.workspace,
               signal,
             ),
-            REPEATABLE,
           );
           if (!analysis.output.ready) {
             await handOffToHuman(analysis.output.reason);
@@ -412,25 +312,20 @@ export function createKanbyFactory({
           // block stays as the record of what the factory originally proposed.
           await ctx.step('write-brief', (signal) =>
             kanby.update(task.guid, { content: brief }, ctx.workspace, signal),
-            REPEATABLE,
           );
           await ctx.step('move-todo', (signal) =>
             kanby.move(task.guid, 'todo', ctx.workspace, signal),
-            REPEATABLE,
           );
         }
 
         await ctx.step('preflight-git', (signal) =>
           repository.preflight(ctx.workspace, ctx.input.gitlab, signal),
-          REPEATABLE,
         );
         await ctx.step('preflight-gitlab', (signal) =>
           mergeRequests.preflight(ctx.input.gitlab, signal),
-          REPEATABLE,
         );
         await ctx.step('move-in-progress', (signal) =>
           kanby.move(task.guid, 'in_progress', ctx.workspace, signal),
-          REPEATABLE,
         );
 
         let review!: ClaudeHandle<{
@@ -480,12 +375,10 @@ export function createKanbyFactory({
               ctx.workspace,
               signal,
             ),
-            REPEATABLE,
           );
 
           const checked = await ctx.step(`check${suffix}`, (signal) =>
             checks.run(ctx.workspace, ctx.input.testCommand, signal),
-            REPEATABLE,
           );
           await ctx.step(`publish-checks${suffix}`, (signal) =>
             kanby.putOutput(
@@ -506,7 +399,6 @@ export function createKanbyFactory({
               ctx.workspace,
               signal,
             ),
-            REPEATABLE,
           );
 
           if (checked.exitCode !== 0) {
@@ -522,7 +414,6 @@ export function createKanbyFactory({
               ctx.input.maxDiffBytes,
               signal,
             ),
-            REPEATABLE,
           );
           if (staged.truncated) {
             await handOffToHuman(
@@ -567,7 +458,6 @@ export function createKanbyFactory({
               ctx.workspace,
               signal,
             ),
-            REPEATABLE,
           );
 
           const concerns =
@@ -593,11 +483,9 @@ export function createKanbyFactory({
 
         const commit = await ctx.step('commit', (signal) =>
           repository.commit(ctx.workspace, task, ctx.input.gitlab.sourceBranch, signal),
-          REPEATABLE,
         );
         await ctx.step('push', (signal) =>
           repository.push(ctx.workspace, ctx.input.gitlab, commit.sha, signal),
-          REPEATABLE,
         );
 
         // One system of record per step: GitLab owns the merge request, Kanby
@@ -614,202 +502,15 @@ export function createKanbyFactory({
             },
             signal,
           ),
-          REPEATABLE,
         );
         await ctx.step('link-development', (signal) =>
           kanby.linkMergeRequest(task.guid, mergeRequest, ctx.workspace, signal),
-          REPEATABLE,
         );
         await ctx.step('move-in-review', (signal) =>
           kanby.move(task.guid, 'in_review', ctx.workspace, signal),
-          REPEATABLE,
         );
-        await ctx.step('release', (signal) => kanby.release(task.guid, ctx.workspace, signal), REPEATABLE);
-      }
-
-      async function handOffOnFailure(error: unknown): Promise<void> {
-        const reason = `Run failed: ${describe(error)}`;
-        try {
-          await ctx.step('handoff-block', (signal) =>
-            kanby.block(task.guid, reason, ctx.workspace, signal),
-            REPEATABLE,
-          );
-        } catch {
-          // The original failure is the one worth reporting.
-        }
-        try {
-          await ctx.step('handoff-release', (signal) =>
-            kanby.release(task.guid, ctx.workspace, signal),
-            REPEATABLE,
-          );
-        } catch {
-          // Same: a card left claimed is visible on the board, a swallowed cause is not.
-        }
+        await ctx.step('release', (signal) => kanby.release(task.guid, ctx.workspace, signal));
       }
     },
   });
-}
-
-const RISK_ORDER: RiskLevel[] = ['none', 'low', 'medium', 'high'];
-
-function rank(level: RiskLevel): number {
-  return RISK_ORDER.indexOf(level);
-}
-
-/** The dimension a human should look at first, and how hard. */
-function peakRisk(output: {
-  sideEffectRisk: RiskLevel;
-  performanceRisk: RiskLevel;
-  compatibilityRisk: RiskLevel;
-}): { dimension: string; level: RiskLevel } {
-  const dimensions = [
-    { dimension: 'Side-effect', level: output.sideEffectRisk },
-    { dimension: 'Performance', level: output.performanceRisk },
-    { dimension: 'Compatibility', level: output.compatibilityRisk },
-  ];
-  return dimensions.reduce((peak, next) => (rank(next.level) > rank(peak.level) ? next : peak));
-}
-
-/** What the peak risk asks of the human who opens the merge request. */
-function reviewDepth(level: RiskLevel): string {
-  if (level === 'high') return 'deep review';
-  if (level === 'medium') return 'focused review';
-  return 'quick verification';
-}
-
-function label(task: KanbyTask): string {
-  return task.displayNumber === null ? task.guid : `#${task.displayNumber}`;
-}
-
-function withRound(round: number, body: string): string {
-  return round === 1 ? body : `**Revision round ${round}**\n\n${body}`;
-}
-
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function mergeRequestDescription(
-  task: KanbyTask,
-  output: {
-    summary: string;
-    sideEffectRisk: RiskLevel;
-    performanceRisk: RiskLevel;
-    compatibilityRisk: RiskLevel;
-  },
-  type: string | undefined,
-): string {
-  const peak = peakRisk(output);
-  return [
-    output.summary,
-    '',
-    `**Suggested review depth:** ${reviewDepth(peak.level)} — ` +
-    `${peak.dimension.toLowerCase()} risk is ${peak.level}.`,
-    '',
-    type ? `Kanby task: ${task.guid} (${type})` : `Kanby task: ${task.guid}`,
-  ].join('\n');
-}
-
-function formatClassification(output: {
-  type: string;
-  confidence: number;
-  rationale: string;
-  requiresHumanTriage: boolean;
-}): string {
-  return [
-    `**Type:** ${output.type}`,
-    `**Confidence:** ${Math.round(output.confidence * 100)}%`,
-    `**Human triage:** ${output.requiresHumanTriage ? 'required' : 'not required'}`,
-    '',
-    output.rationale,
-  ].join('\n');
-}
-
-function formatAnalysis(
-  output: {
-    ready: boolean;
-    reason: string;
-    evidence: string[];
-    specification: string;
-    plan: string[];
-    compatibility: string;
-    risk: string;
-    requiredChecks: string[];
-  },
-  type: string,
-): string {
-  return [
-    `**Task type:** ${type}`,
-    '',
-    output.reason,
-    '',
-    '## Evidence',
-    '',
-    ...output.evidence.map((item) => `- ${item}`),
-    '',
-    '## Specification',
-    '',
-    output.specification,
-    '',
-    '## Implementation plan',
-    '',
-    ...output.plan.map((item) => `- ${item}`),
-    '',
-    '## Compatibility and risk',
-    '',
-    `**Compatibility:** ${output.compatibility}`,
-    `**Risk:** ${output.risk}`,
-    '',
-    '## Required checks',
-    '',
-    ...output.requiredChecks.map((item) => `- ${item}`),
-  ].join('\n');
-}
-
-function formatCommandOutput(command: string, exitCode: number, stdout: string, stderr: string): string {
-  const transcript = truncate([stdout.trimEnd(), stderr.trimEnd()].filter(Boolean).join('\n'), 20_000);
-  return [
-    '## Command',
-    '',
-    indent(command),
-    '',
-    `Exit code: \`${exitCode}\``,
-    '',
-    '## Output',
-    '',
-    indent(transcript || '(no output)'),
-  ].join('\n');
-}
-
-function formatReview(output: {
-  summary: string;
-  completeness: string;
-  concerns: string[];
-  sideEffectRisk: RiskLevel;
-  performanceRisk: RiskLevel;
-  compatibilityRisk: RiskLevel;
-}): string {
-  const concerns = output.concerns.length > 0
-    ? ['## Concerns', '', ...output.concerns.map((concern) => `- ${concern}`), '']
-    : [];
-  return [
-    output.summary,
-    '',
-    `**Completeness:** ${output.completeness}`,
-    `**Side-effect risk:** ${output.sideEffectRisk}`,
-    `**Performance risk:** ${output.performanceRisk}`,
-    `**Compatibility risk:** ${output.compatibilityRisk}`,
-    `**Suggested review depth:** ${reviewDepth(peakRisk(output).level)}`,
-    '',
-    ...concerns,
-  ].join('\n').trimEnd();
-}
-
-function indent(value: string): string {
-  return value.split('\n').map((line) => `    ${line}`).join('\n');
-}
-
-function truncate(value: string, limit: number): string {
-  if (value.length <= limit) return value;
-  return `${value.slice(0, limit)}\n\n[output truncated at ${limit} characters]`;
 }

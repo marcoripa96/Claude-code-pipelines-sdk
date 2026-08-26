@@ -263,14 +263,16 @@ and `implement` denies `git commit` and `git push` outright. Checks run through
 and commit refuses to run if the workspace changed after the change was staged. A change
 too large to review blocks the task instead of being silently cut.
 
-A run that stops is picked up, not restarted. Every step declares what it does about a
-crash that left it in flight: the board writes, Git and GitLab are all repeatable —
-`move`, `block`, `release` and `development upsert` are set-operations, `commit`
-recognises its own `Kanby-Task:` marker on HEAD, `push` pushes a sha that is already
-there, and `ensure` finds the merge request before creating one — so they say
-`onCrash: 'rerun'`. The single exception is `claim`, which `kanby` guards on the snapshot
-it was read from and which would therefore *fail* rather than duplicate; it asks the board
-whether the claim is already ours and adopts it if so.
+A run that stops is picked up, not restarted. What every step does about a crash that
+left it in flight is declared once, as the pipeline's `defaults: { onCrash: 'rerun' }`,
+because it is a property of the pipeline rather than of twenty separate steps: the board
+writes, Git and GitLab are all repeatable — `move`, `block`, `release` and `development
+upsert` are set-operations, `commit` recognises its own `Kanby-Task:` marker on HEAD,
+`push` pushes a sha that is already there, and `ensure` finds the merge request before
+creating one. The single exception is `claim`, which `kanby` guards on the snapshot it was
+read from and which would therefore *fail* rather than duplicate; it asks the board
+whether the claim is already ours and adopts it if so, which settles the question without
+consulting the default at all.
 
 Workspace edits come back from Git rather than from re-running the session that made
 them: the run is given `gitWorkspaceSnapshots()`, so a replayed `implement` step restores
@@ -305,6 +307,11 @@ The post is the design's source; this example diverges in four places, on purpos
 
 ## Files
 
-- `pipeline.ts` contains the pipeline definition and its narrow dependency interfaces.
+- `contracts.ts` declares what the factory needs from the outside world — the narrow
+  client interfaces and the shapes they speak in. `adapters.ts` depends on this rather
+  than on the driver that calls it.
+- `pipeline.ts` contains the pipeline definition: the stages, the gates and the order.
+- `format.ts` holds the markdown the factory publishes to the board and to the merge
+  request. Pure functions of their arguments, so they are assertable on their own.
 - `adapters.ts` implements the ideal Kanby CLI, local Git and GitBeaker seams.
 - `index.ts` composes the real adapters and requires an explicit `--real` flag.

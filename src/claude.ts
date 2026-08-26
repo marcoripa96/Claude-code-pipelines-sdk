@@ -5,7 +5,82 @@ import {
   type SDKMessage,
   type SDKResultMessage,
 } from '@anthropic-ai/claude-agent-sdk';
-import type { ClaudeRequest, ClaudeResponse, ClaudeRunner } from './types.ts';
+import type { Schema, StepOptionsBase, StepRecord } from './types.ts';
+
+export interface ClaudeStepOptions<S extends Schema | undefined = undefined>
+  extends StepOptionsBase {
+  name: string;
+  prompt: string;
+  /** Declaring a schema turns the session's answer into an Output. */
+  output?: S;
+  /** Extra attempts on session failure, on top of the first. Default `0`. */
+  retry?: number;
+  model?: string;
+  /** Overrides the run's workspace for this step only. */
+  cwd?: string;
+  maxTurns?: number;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  /** Default `'bypassPermissions'`: an unattended pipeline that stops to ask is a hang. */
+  permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
+  /** Default `'all'`; the prompt says which skill to use. */
+  skills?: 'all' | string[];
+  /** Default `['project']`, so `CLAUDE.md` and project skills load. */
+  settingSources?: ('user' | 'project' | 'local')[];
+  mcpServers?: Record<string, unknown>;
+}
+
+/** What a Claude step returns to pipeline code. */
+export interface ClaudeHandle<T = undefined> {
+  name: string;
+  /** The schema-validated Output. Only present when a schema was declared. */
+  output: T;
+  /** Final assistant text. The whole answer when no schema was declared. */
+  text: string;
+  sessionId?: string;
+  cacheHit: boolean;
+  step: StepRecord;
+}
+
+/** One `query()` against the Agent SDK, as the runner asks for it. */
+export interface ClaudeRequest {
+  /** The run this session belongs to. */
+  runId: string;
+  /** The step record this session belongs to. A retried step keeps the same id. */
+  stepId: string;
+  stepName: string;
+  prompt: string;
+  /** `z.toJSONSchema(output)` when a schema was declared. */
+  jsonSchema?: Record<string, unknown>;
+  model?: string;
+  cwd: string;
+  maxTurns?: number;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  permissionMode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
+  skills: 'all' | string[];
+  settingSources: ('user' | 'project' | 'local')[];
+  mcpServers?: Record<string, unknown>;
+  signal?: AbortSignal;
+}
+
+export interface ClaudeResponse {
+  text: string;
+  /** The value read off the result message's `structured_output`. */
+  structuredOutput?: unknown;
+  sessionId?: string;
+  totalCostUsd?: number;
+}
+
+/**
+ * Runs one Claude session. Swapped for `fake()` in tests so branch logic is
+ * assertable without an API call.
+ */
+export type ClaudeRunner = (
+  request: ClaudeRequest,
+  onMessage: (message: SDKMessage) => void,
+) => Promise<ClaudeResponse>;
+
 
 /**
  * The default Claude runner: one `query()` per step, always a fresh session.

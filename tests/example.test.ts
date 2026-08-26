@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { fake } from '@marcoripa96/claude-code-pipelines-sdk';
-import {
-  createKanbyFactory,
-  type KanbyTask,
-  type KanbyFactoryDependencies,
-  type RiskLevel,
-} from '../examples/kanby-software-factory/pipeline.ts';
+import { createKanbyFactory } from '../examples/kanby-software-factory/pipeline.ts';
+import type {
+  KanbyTask,
+  KanbyFactoryDependencies,
+  RiskLevel,
+} from '../examples/kanby-software-factory/contracts.ts';
 
 /**
  * The example is imported by package name, so it breaks loudly when the API changes.

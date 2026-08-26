@@ -88,8 +88,14 @@ Sessions are always fresh: a Claude step never inherits another step's conversat
 Command steps are spawned as `sh -c`, not run through `Bun.$`: a step's `timeout` has to
 be able to kill the process, and `$` exposes no way to cancel one.
 
-Steps execute sequentially, except a group handed to `ctx.commands()` (ADR 0004). Every
-step may declare a `timeout`, enforced by the runner so it bounds all three kinds alike.
+Steps execute sequentially, except a group handed to `ctx.commands()` (ADR 0004), whose
+`concurrency` is a bound of at least one or `Infinity` for unbounded — zero is refused
+rather than read as "all at once". Every step may declare a `timeout`, enforced by the
+runner so it bounds all three kinds alike.
+
+`definePipeline` takes `defaults` for the step options a pipeline sets once rather than at
+every call site. Today that is `onCrash`, because a pipeline whose effects are uniformly
+repeatable is stating a property of itself; a step that disagrees still overrides it.
 
 ## Claude sessions
 
@@ -190,7 +196,9 @@ Three things make this work, and each is an ADR:
   `ctx.now()`, `ctx.random()` and `ctx.uuid()` record their answers as steps. A value the
   driver reads for itself either re-runs every step below it or is silently discarded on
   replay, depending on whether it reaches a step's declaration.
-- **Snapshots restore the workspace** (0011). Replay restores Outputs, not the files a
+- **Snapshots restore the workspace** (0011). A run resumed without the adapter that
+  captured its snapshots stops with `WorkspaceUnrestorableError`, rather than replaying
+  Outputs onto a tree it never put back. Replay restores Outputs, not the files a
   session edited. `gitWorkspaceSnapshots()` captures the working tree and the index after
   each step behind `refs/pipelines/<runId>/<step>`, and a resumed run puts the tree back
   once, at the first step that must do real work.

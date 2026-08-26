@@ -1,6 +1,24 @@
-import type { CommandHandle, CommandStepOptions, StepRecord } from './types.ts';
+import type { StepOptionsBase, StepRecord } from './types.ts';
+
+export interface CommandStepOptions extends StepOptionsBase {
+  command: string;
+  /** Return the handle instead of throwing when the command exits non-zero. */
+  allowFailure?: boolean;
+  cwd?: string;
+  env?: Record<string, string>;
+}
+
+/** What a command step returns to pipeline code. */
+export interface CommandHandle {
+  name: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  cacheHit: boolean;
+  step: StepRecord;
+}
+
 import { CommandFailedError } from './errors.ts';
-import type { Runner } from './runner.ts';
 
 export interface CommandOutcome {
   stdout: string;
@@ -52,5 +70,3 @@ export function assertCommandOk(options: CommandStepOptions, outcome: CommandOut
   if (outcome.exitCode === 0 || options.allowFailure) return;
   throw new CommandFailedError({ command: options.command, ...outcome });
 }
-
-export type { Runner };

@@ -6,7 +6,7 @@ import { gitRepository } from '../examples/kanby-software-factory/adapters.ts';
 import type {
   GitLabDestination,
   KanbyTask,
-} from '../examples/kanby-software-factory/pipeline.ts';
+} from '../examples/kanby-software-factory/contracts.ts';
 
 describe('the kanby-software-factory Git adapter', () => {
   test('validates the destination and reuses a task commit after an ambiguous retry', async () => {

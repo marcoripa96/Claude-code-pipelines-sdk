@@ -1,5 +1,5 @@
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
-import type { ClaudeRequest, ClaudeResponse, ClaudeRunner } from './types.ts';
+import type { ClaudeRequest, ClaudeResponse, ClaudeRunner } from './claude.ts';
 
 const SESSION = Symbol.for('claude-code-pipelines-sdk.fakeSession');
 

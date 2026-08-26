@@ -1,7 +1,8 @@
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import type { ClaudeRunner } from './claude.ts';
 import type {
   CacheAdapter,
-  ClaudeRunner,
+  CrashPolicy,
   RunEvents,
   RunRecord,
   RunResult,
@@ -9,9 +10,15 @@ import type {
   StepKind,
   StepRecord,
   StorageAdapter,
+  WorkspaceSnapshots,
 } from './types.ts';
-import type { WorkspaceSnapshots } from './types.ts';
-import { HaltSignal, RunTakenError, StepFailedError, isHalt, messageOf } from './errors.ts';
+import {
+  RunTakenError,
+  StepFailedError,
+  WorkspaceUnrestorableError,
+  isHalt,
+  messageOf,
+} from './errors.ts';
 import { NEVER_ABORTS, withTimeout } from './timeout.ts';
 
 /** Everything a run needs that is not specific to one step kind. */
@@ -33,10 +40,37 @@ export interface RunnerConfig {
   snapshots?: WorkspaceSnapshots;
   /** How often to renew the run's lease. Only used if the adapter can record one. */
   heartbeatMs?: number;
+  /** Step options the pipeline declared once, for every step that does not override them. */
+  defaults?: StepDefaults;
+}
+
+/**
+ * What a pipeline sets once instead of on every step. A pipeline whose steps are
+ * uniformly repeatable says so here rather than repeating `onCrash` at two dozen call
+ * sites, which is the kind of repetition that stops being read.
+ */
+export interface StepDefaults {
+  onCrash?: CrashPolicy;
 }
 
 /** Default lease renewal interval. A supervisor's `staleMs` should be a few of these. */
 export const HEARTBEAT_MS = 15_000;
+
+/**
+ * What a step's work hands back.
+ *
+ * Everything a step *produced* travels here rather than being written onto the record,
+ * so there is one channel for results and one rule for the exceptions: a field that must
+ * survive the step failing — `exitCode`, `attempts` — is annotated on the live record
+ * instead, because a failed step never returns at all.
+ */
+export interface StepWork<T> {
+  /** What the step returns to pipeline code. */
+  value: T;
+  output?: unknown;
+  text?: string;
+  sessionId?: string;
+}
 
 /**
  * Owns one run: step ordering, records, lifecycle events and the write-through to
@@ -123,6 +157,10 @@ export class Runner {
   noteReplayed(step: StepRecord, prior: StepRecord): void {
     step.replayed = true;
     if (prior.snapshot === undefined) return;
+    // Without an adapter this run could neither restore the tree nor honestly record
+    // that it had one, and the steps below would work against a workspace that does not
+    // match the record they are handed. Stopping is the only answer that is not a guess.
+    if (!this.config.snapshots) throw new WorkspaceUnrestorableError(step.name);
     step.snapshot = prior.snapshot;
     this.owedSnapshot = prior.snapshot;
   }
@@ -216,14 +254,16 @@ export class Runner {
   }
 
   /**
-   * Runs one step, recording it whatever happens. `work` receives the live record so
-   * a step kind can annotate it (exit code, session id, cache hit) before it finishes,
-   * and the signal it must do its work under — the run's, narrowed by this step's
-   * `timeout` when it declared one.
+   * Runs one step, recording it whatever happens.
+   *
+   * `work` returns what the step produced, and receives the live record so it can
+   * annotate the things that must be recorded even when the step goes on to fail — an
+   * exit code, an attempt count. It also receives the signal it must do its work under:
+   * the run's, narrowed by this step's `timeout` when it declared one.
    */
   async execute<T>(
     step: StepRecord,
-    work: (step: StepRecord, signal: AbortSignal) => Promise<{ value: T; output?: unknown; text?: string }>,
+    work: (step: StepRecord, signal: AbortSignal) => Promise<StepWork<T>>,
     options: { timeout?: number; identify?: () => Promise<string | undefined> } = {},
   ): Promise<T> {
     this.throwIfAborted();
@@ -258,6 +298,7 @@ export class Runner {
       step.status = 'completed';
       if (result.output !== undefined) step.output = result.output;
       if (result.text !== undefined) step.text = result.text;
+      if (result.sessionId !== undefined) step.sessionId = result.sessionId;
       // Before the step is recorded as finished, so a snapshot that cannot be taken
       // fails the step through the ordinary path rather than after it.
       await this.captureSnapshot(step);
@@ -415,5 +456,3 @@ function report(events: RunEvents, error: unknown): void {
     console.error('[claude-code-pipelines-sdk] the error it was reporting:', error);
   }
 }
-
-export { HaltSignal };

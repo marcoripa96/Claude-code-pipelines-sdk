@@ -9,7 +9,23 @@ import type {
   RepositoryClient,
   TaskOutputInput,
   TaskStatus,
-} from './pipeline.ts';
+} from './contracts.ts';
+
+/**
+ * The variables that carry write authority.
+ *
+ * One list, because it is one rule: a child process gets a credential only by being
+ * handed it. `runProcess` strips them from every spawn, and the entry point strips them
+ * from this process so that Claude sessions — which inherit it — cannot see them either.
+ * Both enforce the same rule from the same declaration rather than from two lists that
+ * can drift apart.
+ */
+export const PRIVILEGED_ENV = [
+  'GITLAB_TOKEN',
+  'KANBY_API_KEY',
+  'KANBY_AGENT',
+  'SSH_AUTH_SOCK',
+] as const;
 
 interface ProcessResult {
   stdout: string;
@@ -445,10 +461,7 @@ async function runProcess(
   env?: Record<string, string>,
 ): Promise<ProcessResult> {
   const childEnv = { ...process.env };
-  delete childEnv.GITLAB_TOKEN;
-  delete childEnv.KANBY_API_KEY;
-  delete childEnv.KANBY_AGENT;
-  delete childEnv.SSH_AUTH_SOCK;
+  for (const name of PRIVILEGED_ENV) delete childEnv[name];
   if (env) Object.assign(childEnv, env);
   const child = Bun.spawn(command, {
     cwd,
